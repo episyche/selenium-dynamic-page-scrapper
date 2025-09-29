@@ -1,0 +1,7 @@
+# Ignore logs
+*.log
+*.png
+*.db
+.env
+__pycache__
+
