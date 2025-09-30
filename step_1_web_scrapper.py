@@ -419,7 +419,7 @@ class WebElementFinder:
                     # "location": element.location,
                     # "size": element.size,
                     "is_displayed":"true" if element.is_displayed() else "false",
-                    "is_enabled": "true" if element.is_displayed() else "false",
+                    "is_enabled": "true" if element.is_enabled() else "false",
                     "xpath": xp,
                 }
 
