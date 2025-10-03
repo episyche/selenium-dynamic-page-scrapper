@@ -23,7 +23,7 @@ def login_to_website(url,username, password, username_selector, password_selecto
         
         try:
             chrome_options = Options()
-            chrome_options.add_argument("--headless=new")
+            # chrome_options.add_argument("--headless=new")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--window-size=1920,1080")
@@ -32,8 +32,8 @@ def login_to_website(url,username, password, username_selector, password_selecto
             chrome_options.add_argument("--disable-background-timer-throttling")
 
             # Block images (this replaces --disable-images)
-            prefs = {"profile.managed_default_content_settings.images": 2}
-            chrome_options.add_experimental_option("prefs", prefs)
+            # prefs = {"profile.managed_default_content_settings.images": 2}
+            # chrome_options.add_experimental_option("prefs", prefs)
             driver=webdriver.Chrome(options=chrome_options)
             # Navigate to the website
             driver.get(url)

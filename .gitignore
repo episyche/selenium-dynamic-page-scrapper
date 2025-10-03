@@ -4,4 +4,6 @@
 *.db
 .env
 __pycache__
+*.json
+features.md
 

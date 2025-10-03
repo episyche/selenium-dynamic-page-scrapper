@@ -4,7 +4,8 @@ import time
 import hashlib
 import logging
 import traceback
-from typing import Dict, Any, List, Optional     
+import re
+from typing import Dict, Any, List, Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -38,11 +39,12 @@ logging.basicConfig(
 class WebElementFinder:
     """Web element finder with multiple strategies"""
 
-    def __init__(self, url: str,driver:Any=None,avoid_pages:List[str]=[]):
+    def __init__(self, url: str, driver: Any = None, avoid_pages: List[str] = []):
+        """ Use given Chrome driver, or create new if none provided"""
         if driver is None:
             self.session = requests.Session()
             chrome_options = Options()
-            chrome_options.add_argument("--headless=new")
+            # chrome_options.add_argument("--headless=new")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--window-size=1920,1080")
@@ -55,13 +57,24 @@ class WebElementFinder:
             # chrome_options.add_experimental_option("prefs", prefs)
             self.driver = webdriver.Chrome(options=chrome_options)
         else:
-            self.driver=driver
+            self.driver = driver
         self.driver.set_page_load_timeout(10)
-        self.avoid_page=avoid_pages
+        self.avoid_page = avoid_pages
+        self.avoid_buttons = [
+            "logout",
+            "log out",
+            "sign out",
+            "signout",
+            "delete",
+            "remove",
+            "cancel",
+            "close account",
+            "deactivate",
+        ]
 
         self.scraped_urls: List[str] = []
         self._seen_hashes: List[str] = []
-        self.whole_website=[]
+        self.whole_website = []
         self.base_url = url
         parsed = urlparse(url)
         self.origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -75,15 +88,90 @@ class WebElementFinder:
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
 
+    def wait_for_dynamic_content(self, timeout: int = 8):
+        self.driver.execute_script(
+            """
+        window.activeRequests = 0;
+        (function(open) {
+            XMLHttpRequest.prototype.open = function() {
+                window.activeRequests++;
+                this.addEventListener('loadend', function() {
+                    window.activeRequests--;
+                });
+                open.apply(this, arguments);
+            };
+        })(XMLHttpRequest.prototype.open);
+
+        (function(fetch) {
+            window.fetch = function() {
+                window.activeRequests++;
+                return fetch.apply(this, arguments).finally(() => {
+                    window.activeRequests--;
+                });
+            };
+        })(window.fetch);
+        """
+        )
+        start = time.time()
+        # Wait until all API calls are done
+        while True:
+            active = self.driver.execute_script("return window.activeRequests")
+            logging.info(f"active api the pages have {active}")
+            if active == 0:
+                break
+            if time.time() - start > timeout:
+                logging.warning("Timeout waiting for dynamic content")
+                break
+            time.sleep(0.2)  # Wait a little before checking again
+
+        logging.info("All API calls completed!")
+
+    def wait_for_dom_changes(self, timeout: int = 8):
+        """Wait until DOM mutations settle (for React/Vue/SPA apps)."""
+        self.driver.execute_script(
+            """
+        if (!window.__pendingMutations) {
+            window.__pendingMutations = 0;
+            const observer = new MutationObserver(() => {
+                window.__pendingMutations++;
+                clearTimeout(window.__mutationTimeout);
+                window.__mutationTimeout = setTimeout(() => {
+                    window.__pendingMutations = 0;
+                }, 300); // settle time
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+        }
+        """
+        )
+
+        start = time.time()
+        while True:
+            pending = self.driver.execute_script("return window.__pendingMutations")
+            logging.info(f"dom mutation waiting for  {pending}")
+            if pending == 0:
+                break
+            if time.time() - start > timeout:
+                logging.warning("Timeout waiting for DOM changes")
+                break
+            time.sleep(0.2)
+
+    def wait_until_ready(self, timeout: int = 8):
+        """Convenience method: wait for page + dynamic content."""
+        self.wait_for_page_load(timeout)
+        self.wait_for_dynamic_content(timeout)
+        self.wait_for_dom_changes(timeout)
+
     def remove_duplicate_elements(self, elements):
         """Remove visually duplicate elements by hashing key attributes."""
         unique_elements = []
         for el in elements:
             try:
-                
+
                 if el.tag_name in ["style", "noscript", "script"]:
                     continue
 
+                if not el.is_displayed():
+                    continue
 
                 tag_name = el.tag_name
                 text = (el.text or "").strip()[:100]
@@ -110,7 +198,7 @@ class WebElementFinder:
                     parent_form_class = parent_form.get_attribute("class") or ""
                 except Exception:
                     pass
-                
+
                 # Get element's position/location as additional differentiator
                 # try:
                 #     location = el.location
@@ -159,12 +247,11 @@ class WebElementFinder:
         """
         if not href:
             return True
-        
+
         # Check if href contains any word in avoid_page
         if any(word and word in href for word in self.avoid_page):
             logging.info(f"Skipping link due to avoid_page match: {href}")
             return True
-            
 
         href = href.strip()
         # Non-navigational schemes or anchors
@@ -175,9 +262,9 @@ class WebElementFinder:
         abs_url = urljoin(current_url, href)
 
         # removeing query params
-        abs_url=abs_url.split('?')[0]
+        abs_url = abs_url.split("?")[0]
 
-        abs_url=abs_url.split('#')[0]
+        abs_url = abs_url.split("#")[0]
 
         parsed_abs = urlparse(abs_url)
 
@@ -210,6 +297,99 @@ class WebElementFinder:
             except Exception:
                 self.driver.execute_script("arguments[0].click();", element)
 
+    def has_dom_changed(self, previous_dom: str) -> bool:
+        """
+        Compare the previous DOM with the current DOM of the page, ignoring dynamic content.
+
+        Args:
+            previous_dom: The DOM captured before an action (as a string).
+
+        Returns:
+            bool: True if the DOM has meaningfully changed, False otherwise.
+        """
+        # Get current DOM
+        current_dom = self.driver.execute_script(
+            "return document.documentElement.outerHTML"
+        )
+
+        # Normalize both DOMs
+        prev_normalized = self._normalize_dom(previous_dom)
+        curr_normalized = self._normalize_dom(current_dom)
+
+        # Compare using hash
+        prev_hash = hashlib.md5(prev_normalized.encode("utf-8")).hexdigest()
+        curr_hash = hashlib.md5(curr_normalized.encode("utf-8")).hexdigest()
+
+        return prev_hash != curr_hash
+
+    def _normalize_dom(self, dom: str) -> str:
+        """
+        Normalize DOM by removing or standardizing dynamic content.
+
+        Args:
+            dom: Raw DOM string
+
+        Returns:
+            Normalized DOM string
+        """
+        # Remove timestamps and dates (various formats)
+        dom = re.sub(
+            r"\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?",
+            "TIMESTAMP",
+            dom,
+        )
+        dom = re.sub(r"\d{1,2}:\d{2}(:\d{2})?(\s*[AP]M)?", "TIME", dom)
+        dom = re.sub(r"\d{1,2}/\d{1,2}/\d{2,4}", "DATE", dom)
+
+        # Remove dynamic IDs and classes that contain timestamps or random strings
+        dom = re.sub(r'id="[^"]*\d{10,}[^"]*"', 'id="DYNAMIC_ID"', dom)
+        dom = re.sub(r'data-id="[^"]*"', 'data-id="DYNAMIC_ID"', dom)
+        dom = re.sub(r'data-reactid="[^"]*"', 'data-reactid="DYNAMIC_ID"', dom)
+
+        # Remove inline styles that might change (like animations)
+        dom = re.sub(r'style="[^"]*"', 'style="REMOVED"', dom)
+
+        # Remove nonce attributes (security tokens)
+        dom = re.sub(r'nonce="[^"]*"', 'nonce="REMOVED"', dom)
+
+        # Remove CSRF tokens
+        dom = re.sub(
+            r'csrf[-_]token["\s:=]+[^"\s<>]+',
+            'csrf_token="REMOVED"',
+            dom,
+            flags=re.IGNORECASE,
+        )
+
+        # Remove session IDs
+        dom = re.sub(
+            r'session[-_]id["\s:=]+[^"\s<>]+',
+            'session_id="REMOVED"',
+            dom,
+            flags=re.IGNORECASE,
+        )
+
+        # Remove random/UUID patterns
+        dom = re.sub(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            "UUID",
+            dom,
+            flags=re.IGNORECASE,
+        )
+
+        # Remove script tags with timestamps or dynamic content
+        dom = re.sub(
+            r"<script[^>]*>.*?</script>",
+            "<script>REMOVED</script>",
+            dom,
+            flags=re.DOTALL,
+        )
+
+        # Normalize whitespace
+        dom = re.sub(r"\s+", " ", dom)
+        dom = dom.strip()
+
+        return dom
+
     def click_element_and_scrape_child(
         self, element, element_data, url_before_click, is_popup=False
     ):
@@ -221,7 +401,11 @@ class WebElementFinder:
 
         handles_before = self.driver.window_handles[:]
         current_url = self.driver.current_url
+        dom_before = self.driver.execute_script(
+            "return document.documentElement.outerHTML"
+        )
         self.safe_click(element)
+        self.wait_until_ready()
         time.sleep(0.5)  # brief settle
 
         # --- Check if alert popped up immediately ---
@@ -234,7 +418,7 @@ class WebElementFinder:
 
             # Default: dismiss (use accept() if required)
             alert.dismiss()
-            return element_data
+            return element_data, False
         except Exception:
             # No alert → continue with navigation logic
             pass
@@ -257,84 +441,97 @@ class WebElementFinder:
         try:
             wait.until(nav_or_tab_opened)
         except TimeoutException:
-            logging.info("No navigation or new tab detected after click")
-            return element_data  # nothing to do
+            if self.has_dom_changed(dom_before):
+                logging.info("internal routes happen")
+                internal_elements = self.get_element_detail(3, True)
+                element_data["internal_elements"] = internal_elements
+                return element_data, True
+            else:
+                logging.info("No navigation or new tab detected after click")
+                return element_data, False  # nothing to do
 
         # New tab?
         handles_after = self.driver.window_handles[:]
         if len(handles_after) > len(handles_before):
             new_handle = [h for h in handles_after if h not in handles_before][0]
             self.driver.switch_to.window(new_handle)
-            self.wait_for_page_load()
+            self.wait_until_ready()
             new_url = self.driver.current_url.split("?", 1)[0].split("#", 1)[0]
-            element_data["navigate_to"]=new_url
+            element_data["navigate_to"] = new_url
             logging.info(f"New tab opened: {new_url}")
 
             if not self.should_skip_link(current_url, new_url):
                 self.scraped_urls.append(new_url)
-                child_data = self.get_element_detail(wait_time=5)
+                self.get_element_detail(wait_time=5)
 
             # Close child tab and switch back
             self.driver.close()
             self.driver.switch_to.window(handles_before[0])
-            wait.until(EC.url_to_be(url_before_click))
-            return element_data
-
-        # Same tab navigation
-        if self.driver.current_url != url_before_click:
-            self.wait_for_page_load()
-            new_url = self.driver.current_url.split("?", 1)[0].split("#", 1)[0]
-            element_data["navigate_to"]=new_url
-            logging.info(f"Navigated to new page: {new_url}")
-
-            if not self.should_skip_link(current_url, new_url):
-                self.scraped_urls.append(new_url)
-                logging.info(new_url)
-                child_data = self.get_element_detail(wait_time=5)
-                
-
-            # Go back to original page
-            self.driver.back()
-            logging.info(f"navigating back to {url_before_click}")
             try:
                 wait.until(EC.url_to_be(url_before_click))
             except TimeoutException:
                 # Last resort: refresh to recover
                 logging.warning("Back navigation timeout; refreshing original page")
                 self.driver.get(url_before_click)
-                self.wait_for_page_load()
+                self.wait_until_ready()
+            return element_data, False
+
+        # Same tab navigation
+        if self.driver.current_url != url_before_click:
+            self.wait_until_ready()
+            new_url = self.driver.current_url.split("?", 1)[0].split("#", 1)[0]
+            element_data["navigate_to"] = new_url
+            logging.info(f"Navigated to new page: {new_url}")
+
+            if not self.should_skip_link(current_url, new_url):
+                self.scraped_urls.append(new_url)
+                self.get_element_detail(wait_time=5)
+
+            # Go back to original page
+            self.driver.back()
+            logging.info(f"navigating back to {url_before_click}")
+            self.wait_until_ready()
+            try:
+                wait.until(EC.url_to_be(url_before_click))
+            except TimeoutException:
+                # Last resort: refresh to recover
+                logging.warning("Back navigation timeout; refreshing original page")
+                self.driver.get(url_before_click)
+                self.wait_until_ready()
+
 
         # here to write the logic for drop down,popup
 
-        return element_data
+        return element_data, False
 
     # --- main routines ---
 
-    def find_all_elements_dynamic(
-        self, url=None, wait_time: int = 8
-    ) -> Dict[str, Any]:
+    def find_all_elements_dynamic(self, url=None, wait_time: int = 8) -> Dict[str, Any]:
         """Find all elements including dynamically loaded content (Selenium)"""
 
         if url is None:
-            url=self.base_url
+            url = self.base_url
         if url not in self.scraped_urls:
             self.scraped_urls.append(url)
             logging.info(f"step 2 - marking {url} as not yet scraped")
 
         try:
             self.driver.get(url)
-            self.wait_for_page_load()
+            self.wait_until_ready(15)
             return self.get_element_detail(wait_time)
         except Exception as e:
             logging.error({"error": f"Failed to process page with Selenium: {str(e)}"})
             logging.error(f"Traceback:\n{traceback.format_exc()}")
             return {"error": f"Failed to process page with Selenium: {str(e)}"}
 
-    def get_element_detail(self, wait_time: int) -> Dict[str, Any]:
+    def get_element_detail(
+        self, wait_time: int, internal_route=False
+    ) -> Dict[str, Any]:
+        previous_element = None
+        first_nav_element = None
         WebDriverWait(self.driver, wait_time).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
-        time.sleep(1)  # allow dynamic content to settle a bit
 
         body = self.driver.find_element(By.TAG_NAME, "body")
         all_elements = body.find_elements(By.XPATH, ".//*")
@@ -342,12 +539,14 @@ class WebElementFinder:
         logging.info("step 3 - filtering unique elements")
         unique_elements = self.remove_duplicate_elements(all_elements)
 
+        popup_data = None
         # handles popups on loading pages
-        try:
-            popup_data = self.detect_and_handle_popups()
-        except Exception:
-            # No alert → continue with poplogic logic
-            pass
+        if not internal_route:
+            try:
+                popup_data = self.detect_and_handle_popups()
+            except Exception:
+                # No alert → continue with poplogic logic
+                pass
 
         # IMPORTANT: work with XPaths to avoid stale references after navigation
         xpaths = []
@@ -371,23 +570,12 @@ class WebElementFinder:
         if popup_data:
             result["metadata"]["popup"] = popup_data
 
-        #     all_dropdowns = []
-
-        #     dropdown_selectors = [
-        #     "//div[contains(@class,'dropdown')]",
-        #     "//ul[contains(@class,'dropdown-menu') and contains(@style,'display: block')]",
-        #     "//div[@aria-expanded='true']",
-        #     "//div[@role='menu' and @aria-hidden='false']",
-        # ]
-        #     for selector in dropdown_selectors:
-        #         all_dropdowns.extend(self.driver.find_elements(By.XPATH, selector))
-
-        #     dropdown_xpaths = [self.get_element_xpath(d) for d in all_dropdowns]
-
         logging.info("step 5 - iterating elements safely by XPath")
         for xp in xpaths:
             try:
-                logging.info(xp)
+                WebDriverWait(self.driver, 3).until(
+                    EC.presence_of_element_located((By.XPATH, xp))
+                )
                 element = self.driver.find_element(By.XPATH, xp)
 
                 # Build element snapshot BEFORE clicking
@@ -418,12 +606,12 @@ class WebElementFinder:
                     ),
                     # "location": element.location,
                     # "size": element.size,
-                    "is_displayed":"true" if element.is_displayed() else "false",
+                    "is_displayed": "true" if element.is_displayed() else "false",
                     "is_enabled": "true" if element.is_enabled() else "false",
                     "xpath": xp,
                 }
 
-                if element_data["tag"] in ("div") and element_data["text"]=="":
+                if element_data["tag"] in ("div") and element_data["text"] == "":
                     continue
                 # Handle hover interactions for specific elements
                 if element.tag_name in (
@@ -431,7 +619,7 @@ class WebElementFinder:
                     "button",
                     "div",
                     "li",
-                ) and self.is_element_clickable(element):
+                ) and self.is_element_visible(element):
                     hover_success = self.safe_hover(element)
                     if hover_success:
                         time.sleep(0.5)  # Wait for any dropdown/popup to appear
@@ -440,24 +628,6 @@ class WebElementFinder:
                         dropdown_data = self.detect_dropdown_after_hover()
                         if dropdown_data:
                             element_data["dropdown"] = dropdown_data
-
-                # dropdown_selectors = [
-                #     "//div[contains(@class,'dropdown')]",
-                #     "//ul[contains(@class,'dropdown-menu') and contains(@style,'display: block')]",
-                #     "//div[@aria-expanded='true']",
-                #     "//div[@role='menu' and @aria-hidden='false']",
-                # ]
-
-                # all_dropdowns = []
-                # for selector in dropdown_selectors:
-                #     all_dropdowns.extend(self.driver.find_elements(By.XPATH, selector))
-
-                # visible_dropdowns = [d for d in all_dropdowns if d.is_displayed()]
-
-                # if element in visible_dropdowns:
-                #     popup_data = self.extract_popup_details(element, "dropdown")
-                #     self.close_popup(element, "dropdown")
-                #     element_data["dropdown"] = popup_data
 
                 clickable = element.is_enabled() and self.is_probably_clickable(element)
 
@@ -469,27 +639,75 @@ class WebElementFinder:
                         if self.should_skip_link(current_url, href):
                             result["web_elements"].append(element_data)
                             continue
-                    if element.text.replace(" ", "").lower() == "logout":
+
+                    # check for logout ,delete etc button to avoid clicking
+                    processed_text = element.text.lower().strip()[:100]
+                    # converting avoid pages to lower
+                    self.avoid_buttons = [
+                        k.lower() for k in self.avoid_buttons
+                    ]
+                    # Check if the processed text is in the list
+                    if any(keyword in processed_text for keyword in self.avoid_buttons):
                         result["web_elements"].append(element_data)
                         continue
-                    element_data = self.click_element_and_scrape_child(
-                    element, element_data, url_before_click=current_url
-                    )                        
+                    element_data, internal_element = (
+                        self.click_element_and_scrape_child(
+                            element, element_data, url_before_click=current_url
+                        )
+                    )
                     result["web_elements"].append(element_data)
+                    if not first_nav_element and internal_element:
+                        first_nav_element = previous_element
+                    if internal_element:
+                        if first_nav_element:
+                            try:
+                                # First attempt to find and click
+                                first_element = self.driver.find_element(
+                                    By.XPATH, first_nav_element
+                                )
+                                # Click safely
+                                self.safe_click(first_element)
+                                logging.info(
+                                    f"find the the previous element in the {first_nav_element} and click the element"
+                                )
+                                self.wait_until_ready()
+                                if self.driver.current_url != current_url:
+                                    logging.info("navigating to wrong page returning to current page")
+                                    self.driver.get(current_url)
+                                    self.wait_until_ready()
+                            except NoSuchElementException:
+                                # If not found, refresh the page and try again
+                                logging.error(
+                                    f"unable to find the the previous element in the {first_nav_element}"
+                                )
+                                self.driver.refresh()
+                                self.wait_until_ready()
+                        else:
+                            # If not found, refresh the page and try again
+                            logging.info("no previous element let refresh the page")
+                            self.driver.refresh()
+                            self.wait_until_ready()
+
+                    previous_element = xp
                 else:
                     result["web_elements"].append(element_data)
 
             except (NoSuchElementException, StaleElementReferenceException) as e:
                 logging.error(f"Element vanished or stale for xpath={xp}: {e}")
                 continue
+
+            except TimeoutException as e:
+                logging.error(f"unable to find element in {xp} :{e}")
             except Exception as e:
                 logging.error(f"Unexpected error for xpath={xp}: {e}")
                 logging.error(f"Traceback:\n{traceback.format_exc()}")
                 continue
+        if internal_route:
+            return result["web_elements"]
         self.whole_website.append(result)
         return result
-    
-    def is_probably_clickable(self,element):
+
+    def is_probably_clickable(self, element):
         if element.get_attribute("onclick"):
             return True
         if element.tag_name in ("a", "button"):
@@ -500,9 +718,8 @@ class WebElementFinder:
             return True
         return False
 
-
-    def is_element_clickable(self, element) -> bool:
-        """Check if element is truly clickable"""
+    def is_element_visible(self, element) -> bool:
+        """Check if element is truly visible"""
         try:
             if not element.is_displayed() or not element.is_enabled():
                 return False
@@ -523,9 +740,6 @@ class WebElementFinder:
 
     def safe_hover(self, element):
         """Hover over an element safely with multiple fallback strategies."""
-        if not self.is_element_clickable(element):
-            return False
-
         try:
             # Strategy 1: Scroll element into view and hover
             self.driver.execute_script(
@@ -575,8 +789,10 @@ class WebElementFinder:
         """Detect dropdowns that appear after hovering"""
         try:
             dropdown_selectors = [
+                # Common dropdown containers
                 "//div[contains(@class,'dropdown-menu') and contains(@style,'display: block')]",
                 "//ul[contains(@class,'dropdown-menu') and @style and contains(@style,'display') and not(contains(@style,'none'))]",
+                "//ul[contains(@class,'sub-menu') and contains(@style,'display: block')]",
                 "//div[@aria-expanded='true']",
                 "//div[@role='menu' and @aria-hidden='false']",
             ]
@@ -586,6 +802,7 @@ class WebElementFinder:
                 visible_dropdowns = [d for d in dropdowns if d.is_displayed()]
 
                 if visible_dropdowns:
+                    logging.info("dropdown detected ")
                     dropdown = visible_dropdowns[0]
                     dropdown_data = self.extract_popup_details(dropdown, "dropdown")
                     self.close_popup(dropdown, "dropdown")
@@ -594,6 +811,7 @@ class WebElementFinder:
         except Exception as e:
             logging.error(f"Error detecting dropdown after hover: {e}")
             return None
+
 
     def get_element_xpath(self, element) -> str:
         """Generate an absolute XPath for a Selenium WebElement (with SVG support)"""
@@ -620,7 +838,6 @@ class WebElementFinder:
             """,
             element,
         )
-
 
     def detect_and_handle_popups(self):
         """
@@ -739,7 +956,7 @@ class WebElementFinder:
             )
 
             for elem in interactive_elements:
-                if elem.is_displayed():
+                if self.is_element_visible(elem):
                     elem_info = {
                         "tag": elem.tag_name,
                         "text": elem.text.strip(),
@@ -751,7 +968,7 @@ class WebElementFinder:
                         "xpath": self.get_element_xpath(elem),
                     }
                     if elem_info["tag"] in ("button", "a") and popup_type == "dropdown":
-                        elem_info = self.click_element_and_scrape_child(
+                        elem_info, _ = self.click_element_and_scrape_child(
                             elem, elem_info, self.driver.current_url, True
                         )
 
@@ -818,7 +1035,7 @@ class WebElementFinder:
                 ".//*[@aria-label='Close']",
                 ".//*[contains(@class,'btn-close')]",
                 ".//*[contains(@data-dismiss,'modal')]",
-                ".//button[.//svg]"
+                ".//button[.//svg]",
             ]
 
             for selector in close_selectors:
@@ -867,15 +1084,12 @@ class WebElementFinder:
 
 # --- run ---
 if __name__ == "__main__":
-    finder = WebElementFinder("http://localhost:3000/",)
+    finder = WebElementFinder(
+        "http://localhost:3000/",
+    )
     try:
         finder.find_all_elements_dynamic()
-        result=finder.whole_website
-        # https://www.mockaroo.com/
-        # http://localhost:3000/
-        # https://www.behold.cam/
-        # https://unlovedai.com/
-        # https://bandbooker.com/
+        result = finder.whole_website
         with open("output.json", "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         logging.info("output saved")

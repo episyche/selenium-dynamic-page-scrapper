@@ -1,6 +1,8 @@
 import os
 import requests
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo 
 import base64
 from typing import Dict, Any
 from selenium.webdriver.chrome.options import Options
@@ -23,11 +25,11 @@ class Browser:
         """Initialize the Chrome WebDriver."""
         chrome_options = Options()
         chrome_options.binary_location = r"C:\Program Files\Google\Chrome\Application\chrome.exe"  # Update path if different
-
+        chrome_options.add_argument("--start-maximized")
         self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
         self.driver.set_page_load_timeout(60)
 
-    def wait_for_page_load(self, timeout: int = 15):
+    def wait_for_page_load(self, timeout: int = 20):
         WebDriverWait(self.driver, timeout).until(
             lambda d: d.execute_script("return document.readyState") == "complete"
         )
@@ -97,8 +99,9 @@ class Browser:
         """Take a screenshot of the current page."""
         self.ensure_driver()
         try:
+            ts = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y%m%d_%H%M%S")
             if filename is None:
-                filename = f"screenshot_{int(time.time())}.png"
+                filename = f"screenshot_{ts}.png"
             self.driver.save_screenshot(filename)
             return {"success": True, "filename": filename}
         except Exception as e:
@@ -130,6 +133,7 @@ class Browser:
     ) -> Dict[str, Any]:
         """Send keys to an input element."""
         self.ensure_driver()
+        time.sleep(2)
         try:
             element = self.driver.find_element(By.XPATH, xpath)
             if clear_first:
@@ -436,10 +440,10 @@ if __name__ == "__main__":
     browser = Browser()
     print(browser.navigate("https://www.cricbuzz.com/"))
     time.sleep(1)
-#     print(browser.find_element("/html/body/div[1]/div[2]/div[6]/div[2]/div/div[7]/a"))
-#     print(browser.hover_element("/html/body/div[1]/div[2]/div[6]/div[2]/div/div[7]/a"))
-#     time.sleep(10)
-#     print(browser.click_element("/html/body/div[1]/div[2]/div[6]/div[2]/div/div[7]/a"))
+    print(browser.find_element("/html/body/header/div/nav/a[2]"))
+    print(browser.hover_element("/html/body/header/div/nav/a[2]"))
+    time.sleep(10)
+    print(browser.click_element("/html/body/header/div/nav/a[2]"))
 #     # print(browser.send_keys("/html/body/div[2]/div/div/div/div[2]/div/div/div/form/div[1]/div/input","lionel messi"))
 #     # print(
 #     #     browser.upload_file_direct(

@@ -15,12 +15,17 @@ def main():
     args = parser.parse_args()
 
 
-    # login to dende hardcoded
-    driver=login_to_website("https://v2.dende.ai/login","melissa-rogers@powerscrews.com",'Test123!',"/html/body/div[1]/div[1]/main/div[1]/div/form/div[1]/div/input","/html/body/div[1]/div[1]/main/div[1]/div/form/div[2]/div/input","/html/body/div[1]/div[1]/main/div[1]/div/form/button")
-    time.sleep(5)
-    print("running Scrapping whole page")
+    # # login to dende hardcoded
+    # driver=login_to_website("https://v2.dende.ai/login","melissa-rogers@powerscrews.com",'Test123!',"/html/body/div[1]/div[1]/main/div[1]/div/form/div[1]/div/input","/html/body/div[1]/div[1]/main/div[1]/div/form/div[2]/div/input","/html/body/div[1]/div[1]/main/div[1]/div/form/button")
+    # time.sleep(5)
+    # print("running Scrapping whole page")
 
-    finder = WebElementFinder(args.website_source,driver) #include driver from login for same driver
+    # login to instaenly  hardcoded
+    # driver=login_to_website("https://app.instantly.ai/auth/login","sabarish@episyche.com",'Test@123!',"/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[1]/input","/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[2]/input","/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[2]/div[1]/button")
+    # time.sleep(5)
+    # print("running Scrapping whole page")
+
+    finder = WebElementFinder(args.website_source) #include driver from login for same driver
     urls=[]
     finder.find_all_elements_dynamic()
     website=finder.whole_website
@@ -35,9 +40,9 @@ def main():
     print("\nRunning Step 2: Converting HTML to text...")
     step3_main(website)
 
-    # Run step 4
-    print("summarize the json")
-    summarize()
+    # # Run step 4
+    # print("summarize the json")
+    # summarize()
 
 if __name__ == "__main__":
     main()
