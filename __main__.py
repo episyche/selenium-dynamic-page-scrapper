@@ -25,7 +25,7 @@ def main():
     # time.sleep(5)
     # print("running Scrapping whole page")
 
-    finder = WebElementFinder(args.website_source) #include driver from login for same driver
+    finder = WebElementFinder(args.website_source,avoid_pages=["blog","ai-quiz-maker-from-pdf","ai-flashcard-maker"]) #include driver from login for same driver
     urls=[]
     finder.find_all_elements_dynamic()
     website=finder.whole_website
