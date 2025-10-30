@@ -9,8 +9,10 @@ import traceback
 import time
 from dataclasses import dataclass, field
 import hashlib
+
 # import sqlite3
 import aiosqlite
+from bs4 import BeautifulSoup
 from datetime import datetime
 
 # --- logging setup (ensure directory exists) ---
@@ -70,9 +72,11 @@ class ThreadSafeState:
                 "scraped_urls": len(self.scraped_urls),
                 "results_count": len(self.results_all),
             }
-            
+
+
 class Database_Handler:
     """Manages SQLite database operations for scraping results"""
+
     def __init__(self, db_path: str = "scraper_data.db"):
         self.db_path = db_path
         self._initialized = False
@@ -83,7 +87,8 @@ class Database_Handler:
             return
 
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
+            await db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS pages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     url TEXT UNIQUE,
@@ -91,7 +96,8 @@ class Database_Handler:
                     elements_json TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-            """)
+            """
+            )
             await db.commit()
         self._initialized = True
         logging.info("[DB] Initialized database and ensured table exists.")
@@ -101,10 +107,13 @@ class Database_Handler:
         try:
             await self._init_db()
             async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("""
+                await db.execute(
+                    """
                     INSERT OR REPLACE INTO pages (url, title, elements_json)
                     VALUES (?, ?, ?)
-                """, (url, title, json.dumps(elements, ensure_ascii=False)))
+                """,
+                    (url, title, json.dumps(elements, ensure_ascii=False)),
+                )
                 await db.commit()
             logging.info(f"[DB] Saved page: {url}")
         except Exception as e:
@@ -114,9 +123,12 @@ class Database_Handler:
         """Fetch all saved pages asynchronously."""
         await self._init_db()
         async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT id, url, title, elements_json FROM pages") as cursor:
+            async with db.execute(
+                "SELECT id, url, title, elements_json FROM pages"
+            ) as cursor:
                 rows = await cursor.fetchall()
         return rows
+
 
 class RecursiveScraper:
     def __init__(self, start_url, max_concurrency=1, avoid_page=None):
@@ -129,9 +141,9 @@ class RecursiveScraper:
         self.pause_event.set()  # Initially not paused
         self.worker_pages: Dict[int, Set] = {}
         self.unique_element = []
-        
-        self.navigatable_elements= {}
-        
+
+        self.navigatable_elements = {}
+
         # Replace shared state with thread-safe container
         self.state = ThreadSafeState()
         self.db = Database_Handler("scraper_data.db")
@@ -146,7 +158,7 @@ class RecursiveScraper:
             "urls_skipped": 0,
             "errors": 0,
         }
-        
+
         # Optional: Add click lock for extra safety
         self.click_lock = asyncio.Lock()
 
@@ -332,7 +344,9 @@ class RecursiveScraper:
 
             # to avoid click both parent and child elements
             parent_xpath = None
-            duplicate_parent_xpath=None
+            duplicate_parent_xpath = None
+            previous_element_xpath = None
+            clciked_xpaths = []
             for xpath in xpaths:
                 await self.pause_event.wait()
                 try:
@@ -363,10 +377,10 @@ class RecursiveScraper:
                         "attributes": attrs,
                         "xpath": xpath,
                     }
-                    
-                    all_text=await element.evaluate("(el) => el.innerText || ''")
-                    
-                    # comparing all the text including child elements to avoid duplicates and check modifications 
+
+                    all_text = await element.evaluate("(el) => el.innerText || ''")
+
+                    # comparing all the text including child elements to avoid duplicates and check modifications
                     element_data_include_child_text = {
                         "tag": tag.lower(),
                         "text": direct_text,
@@ -374,7 +388,7 @@ class RecursiveScraper:
                         "xpath": xpath,
                         "all_text": all_text,
                     }
-                    
+
                     attrs_sorted = sorted(attrs.items())
                     # Combine all element info into a list
                     key_list = [tag.lower(), xpath, direct_text, attrs_sorted]
@@ -384,14 +398,18 @@ class RecursiveScraper:
 
                     # Create hashcode
                     key_hash = hashlib.sha256(key_str.encode()).hexdigest()
-                    if duplicate_parent_xpath and self.is_child_xpath(duplicate_parent_xpath, xpath):
+                    if duplicate_parent_xpath and self.is_child_xpath(
+                        duplicate_parent_xpath, xpath
+                    ):
                         logging.info(
                             f"[Worker {worker_id}] Skipping element inside duplicate parent: {xpath} in {url}"
                         )
-                        navigation=self.navigatable_elements.get(key_hash)
+                        navigation = self.navigatable_elements.get(key_hash)
                         if navigation:
-                            logging.info(f"[Worker {worker_id}] Found previous navigation for duplicate element: {navigation}")
-                            element_data["navigated_to"]=navigation
+                            logging.info(
+                                f"[Worker {worker_id}] Found previous navigation for duplicate element: {navigation}"
+                            )
+                            element_data["navigated_to"] = navigation
                         visible_elements.append(element_data)
                         continue
                     elif element_data_include_child_text in self.unique_element:
@@ -400,10 +418,12 @@ class RecursiveScraper:
                             f"[Worker {worker_id}] Duplicate element skipped: {xpath} in {url}"
                         )
                         # Check if we have navigation info for this duplicate
-                        navigation=self.navigatable_elements.get(key_hash)
+                        navigation = self.navigatable_elements.get(key_hash)
                         if navigation:
-                            logging.info(f"[Worker {worker_id}] Found previous navigation for duplicate element: {navigation}")
-                            element_data["navigated_to"]=navigation
+                            logging.info(
+                                f"[Worker {worker_id}] Found previous navigation for duplicate element: {navigation}"
+                            )
+                            element_data["navigated_to"] = navigation
                         visible_elements.append(element_data)
                         continue
                     else:
@@ -430,37 +450,42 @@ class RecursiveScraper:
 
                         # Set up new page detection BEFORE clicking
                         new_page_future = asyncio.Future()
-                        
+
                         def on_popup(popup):
                             if not new_page_future.done():
                                 new_page_future.set_result(popup)
-                        
+
                         # Register the popup listener
                         page.on("popup", on_popup)
-                        
+
                         try:
                             # Optional: Use click lock for extra safety
                             # async with self.click_lock:
-                            
-                            # getting the dom details before clicking 
-                            dom_before = await page.evaluate("document.documentElement.outerHTML")                            
-                                                      
+
+                            # getting the dom details before clicking
+                            dom_before = await page.evaluate(
+                                "document.documentElement.outerHTML"
+                            )
+
                             # Click the element
                             await handle.evaluate("(el) => el.click()")
                             parent_xpath = xpath
+                            clciked_xpaths.append(xpath)
 
                             # Wait for popup with timeout
                             try:
-                                new_tab = await asyncio.wait_for(new_page_future, timeout=2.0)
+                                new_tab = await asyncio.wait_for(
+                                    new_page_future, timeout=2.0
+                                )
                                 self.worker_pages[worker_id].add(new_tab)
-                                
+
                                 await new_tab.wait_for_load_state("domcontentloaded")
                                 new_url = new_tab.url
                                 logging.info(
                                     f"[Worker {worker_id}] Detected new tab: {new_url}"
                                 )
                                 element_data["opened_new_tab"] = new_url
-                                self.navigatable_elements[key_hash]=new_url
+                                self.navigatable_elements[key_hash] = new_url
                                 if not self.should_skip_link(previous_url, new_url):
                                     already_scraped = await self.state.has_scraped_url(
                                         new_url
@@ -493,7 +518,7 @@ class RecursiveScraper:
                                 logging.info(
                                     f"[Worker {worker_id}] No popup detected, checking for navigation"
                                 )
-                                
+
                                 await page.wait_for_load_state(
                                     "domcontentloaded", timeout=30000
                                 )
@@ -504,12 +529,13 @@ class RecursiveScraper:
                                 if page.url != previous_url:
                                     new_url = page.url.split("?")[0].split("#")[0]
                                     element_data["navigated_to"] = new_url
-                                    self.navigatable_elements[key_hash]=new_url
+                                    self.navigatable_elements[key_hash] = new_url
                                     logging.info(
-                                        f"[Worker {worker_id}] Detected same-tab navigation to: {new_url}")
+                                        f"[Worker {worker_id}] Detected same-tab navigation to: {new_url}"
+                                    )
                                     if not self.should_skip_link(previous_url, new_url):
-                                        already_scraped = await self.state.has_scraped_url(
-                                            new_url
+                                        already_scraped = (
+                                            await self.state.has_scraped_url(new_url)
                                         )
                                         if not already_scraped:
                                             await self.to_visit.put(new_url)
@@ -521,7 +547,7 @@ class RecursiveScraper:
                                             logging.info(
                                                 f"[Worker {worker_id}] Navigation URL already scraped: {new_url}"
                                             )
-                                    
+
                                     await page.go_back()
                                     await self.wait_until_ready(
                                         page, timeout=15, settle_time=1
@@ -530,16 +556,80 @@ class RecursiveScraper:
                                     logging.info(
                                         f"[Worker {worker_id}] No navigation occurred after click."
                                     )
-                                    dom_after = await page.evaluate("document.documentElement.outerHTML")
+                                    dom_after = await page.evaluate(
+                                        "document.documentElement.outerHTML"
+                                    )
                                     if dom_before != dom_after:
+                                        if previous_element_xpath is None:
+                                            previous_element_xpath = (
+                                                clciked_xpaths[
+                                                    clciked_xpaths.index(xpath) - 1
+                                                ]
+                                                if clciked_xpaths.index(xpath) > 0
+                                                else None
+                                            )
                                         logging.info(
                                             f"[Worker {worker_id}] DOM changed after click on {xpath} in {url}."
                                         )
-                        
+                                        soup_old = BeautifulSoup(
+                                            dom_before, "html.parser"
+                                        )
+                                        soup_new = BeautifulSoup(
+                                            dom_after, "html.parser"
+                                        )
+
+                                        old_elements = self.extract_dom_structure(
+                                            soup_old
+                                        )
+                                        new_elements = self.extract_dom_structure(
+                                            soup_new
+                                        )
+
+                                        changes = self.compare_doms(
+                                            old_elements, new_elements, True
+                                        )
+
+                                        if changes["added"]:
+                                            logging.info("internal routes detected ")
+                                            element_data["internal_routes"] = changes[
+                                                "added"
+                                            ]
+
+                                        previous_element = (
+                                            await page.query_selector(
+                                                f"xpath={previous_element_xpath}"
+                                            )
+                                            if previous_element_xpath
+                                            else None
+                                        )
+                                        if previous_element:
+                                            logging.info(
+                                                f"[Worker {worker_id}] Returning to previous element {previous_element_xpath} after DOM change."
+                                            )
+                                            await previous_element.evaluate(
+                                                "(el) => el.click()"
+                                            )
+                                            await self.wait_until_ready(
+                                                page, timeout=15, settle_time=1
+                                            )
+
+                                        else:
+                                            logging.info(
+                                                f"[Worker {worker_id}] No previous element to return to after DOM change so clciking the same elements."
+                                            )
+                                            await element.evaluate("(el) => el.click()")
+                                            await self.wait_until_ready(
+                                                page, timeout=15, settle_time=1
+                                            )
+                                    else:
+                                        logging.info(
+                                            f"[Worker {worker_id}] DOM did not change after click on {xpath} in {url}."
+                                        )
+                                        previous_element_xpath = None
+
                         finally:
                             # Remove the popup listener
                             page.remove_listener("popup", on_popup)
-
                     visible_elements.append(element_data)
 
                 except Exception as e:
@@ -558,11 +648,12 @@ class RecursiveScraper:
                     title=page_details["title"],
                     elements=page_details["elements"],
                 )
-                logging.info(f"[Worker {worker_id}] Page saved to database: {page_details['url']}")
+                logging.info(
+                    f"[Worker {worker_id}] Page saved to database: {page_details['url']}"
+                )
             except Exception as e:
                 logging.error(f"[Worker {worker_id}] Error saving to DB: {e}")
 
-            
             await self.update_stats("urls_processed")
 
         except Exception as e:
@@ -579,6 +670,98 @@ class RecursiveScraper:
                     self.worker_pages[worker_id].discard(page)
                 except Exception as e:
                     logging.error(f"[Worker {worker_id}] Error closing page: {e}")
+
+    def extract_dom_structure(self, soup):
+        elements = []
+        for element in soup.find_all(True):  # True = all tags
+            xpath = self.get_xpath_bs(element)
+
+            normalized_attrs = {}
+            for k, v in element.attrs.items():
+                if isinstance(v, list):
+                    normalized_attrs[k] = tuple(v)
+                else:
+                    normalized_attrs[k] = v
+
+            direct_texts = element.find_all(string=True, recursive=False)
+            direct_text = " ".join(t.strip() for t in direct_texts if t.strip())
+            data = {
+                "tag": element.name,
+                "attrs": normalized_attrs,
+                "xpath": xpath,
+                "text": direct_text,
+            }
+            elements.append(data)
+        return elements
+
+    def get_xpath_bs(self, el):
+        parts = []
+        while el and getattr(el, "name", None):
+            parent = el.parent
+
+            # Stop before the document root
+            if not parent or getattr(parent, "name", None) in (
+                None,
+                "[document]",
+            ):
+                parts.append(el.name)
+                break
+
+            # Collect tag siblings in DOM order (ignore strings/comments)
+            same_tag_siblings = [
+                sib for sib in parent.children if getattr(sib, "name", None) == el.name
+            ]
+
+            # Determine index among siblings (1-based like XPath)
+            if len(same_tag_siblings) > 1:
+                try:
+                    index = same_tag_siblings.index(el) + 1
+                    parts.append(f"{el.name}[{index}]")
+                except ValueError:
+                    # fallback if BS made a copy or parsing glitch
+                    parts.append(f"{el.name}[1]")
+            else:
+                parts.append(el.name)
+
+            el = parent
+
+        parts.reverse()
+
+        # Fix duplicate /html/html case
+        if len(parts) >= 2 and parts[0] == "html" and parts[1] == "html":
+            parts = parts[1:]
+
+        return "/" + "/".join(parts)
+
+    def compare_doms(self, old, new, is_include_text=False):
+        # Filter out <body> elements
+        logging.info("comparing doms to detect changes")
+        old_filtered = [e for e in old if e["tag"].lower() != "body"]
+        new_filtered = [e for e in new if e["tag"].lower() not in ["body", "style"]]
+
+        if is_include_text:
+
+            def serialize_attrs(attrs):
+                return tuple(sorted((k, v) for k, v in attrs.items()))
+
+            logging.info("comparing doms with text included")
+            old_set = {(e["xpath"], e["text"]) for e in old_filtered}
+
+            # Keep the order of new elements
+            added = [
+                e["xpath"]
+                for e in new_filtered
+                if (e["xpath"], e["text"]) not in old_set
+            ]
+            logging.info(f"added elements with text {added}")
+            return {"added": added}
+
+        old_set = {(e["xpath"]) for e in old_filtered}
+
+        # Keep the order of new elements
+        added = [(e["xpath"]) for e in new_filtered if (e["xpath"]) not in old_set]
+        logging.info(f"added elements {added}")
+        return {"added": added}
 
     def is_child_xpath(self, parent_xpath, child_xpath):
         """
@@ -624,7 +807,7 @@ class RecursiveScraper:
         self.worker_pages[worker_id] = set()
 
         while True:
-            
+
             await self.pause_event.wait()
             try:
                 url = await self.to_visit.get()
@@ -665,7 +848,10 @@ class RecursiveScraper:
 
     async def run(self):
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False, args=["--disable-web-security","--window-size=1920,1080"])
+            browser = await p.chromium.launch(
+                headless=False,
+                args=["--disable-web-security", "--window-size=1920,1080"],
+            )
             context = await browser.new_context()
 
             # Add initial URL to queue
@@ -742,4 +928,4 @@ class RecursiveScraper:
 
 
 if __name__ == "__main__":
-    asyncio.run(RecursiveScraper("http://localhost:3000/", max_concurrency=10).run())
+    asyncio.run(RecursiveScraper("http://localhost:3000/", max_concurrency=5).run())
