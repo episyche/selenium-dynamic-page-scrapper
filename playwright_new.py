@@ -146,7 +146,7 @@ class RecursiveScraper:
 
         # Replace shared state with thread-safe container
         self.state = ThreadSafeState()
-        self.db = Database_Handler("scraper_data.db")
+        self.db = Database_Handler(f"{parsed.netloc}.db")
 
         self.avoid_page = avoid_page or []
 
@@ -167,7 +167,7 @@ class RecursiveScraper:
         async with self.stats_lock:
             self.stats[key] = self.stats.get(key, 0) + increment
 
-    def should_skip_link(self, current_url: str, href: Optional[str]) -> bool:
+    async def should_skip_link(self, current_url: str, href: Optional[str]) -> bool:
         """Return True if the link should be skipped."""
         if not href:
             logging.info("Skipping link due to empty href")
@@ -332,8 +332,6 @@ class RecursiveScraper:
                 f"Worker {worker_id}: Found {len(all_elements)} elements on {url}"
             )
 
-            visible_elements = []
-            previous_url = page.url
             xpaths = []
 
             # collect all the xpath of visible elements
@@ -341,303 +339,12 @@ class RecursiveScraper:
                 if await element.is_visible():
                     xpath = await element.evaluate(self.get_xpath_js)
                     xpaths.append(xpath)
-
-            # to avoid click both parent and child elements
-            parent_xpath = None
-            duplicate_parent_xpath = None
-            previous_element_xpath = None
-            clciked_xpaths = []
-            for xpath in xpaths:
-                await self.pause_event.wait()
-                try:
-                    element = await page.query_selector(f"xpath={xpath}")
-                    if not element:
-                        continue
-
-                    tag = await element.evaluate("(el) => el.tagName")
-                    if tag.lower() in ["script", "style", "meta", "link", "noscript"]:
-                        continue
-
-                    attrs = await element.evaluate(
-                        "(el) => { let a = {}; for (let attr of el.attributes) a[attr.name] = attr.value; return a; }"
-                    )
-                    direct_text = await element.evaluate(
-                        """
-                        (el) => Array.from(el.childNodes)
-                            .filter(n => n.nodeType === Node.TEXT_NODE)
-                            .map(n => n.textContent.trim())
-                            .filter(t => t.length > 0)
-                            .join(' ')
-                        """
-                    )
-
-                    element_data = {
-                        "tag": tag.lower(),
-                        "text": direct_text,
-                        "attributes": attrs,
-                        "xpath": xpath,
-                    }
-
-                    all_text = await element.evaluate("(el) => el.innerText || ''")
-
-                    # comparing all the text including child elements to avoid duplicates and check modifications
-                    element_data_include_child_text = {
-                        "tag": tag.lower(),
-                        "text": direct_text,
-                        "attributes": attrs,
-                        "xpath": xpath,
-                        "all_text": all_text,
-                    }
-
-                    attrs_sorted = sorted(attrs.items())
-                    # Combine all element info into a list
-                    key_list = [tag.lower(), xpath, direct_text, attrs_sorted]
-
-                    # Serialize to JSON string
-                    key_str = json.dumps(key_list, sort_keys=True)
-
-                    # Create hashcode
-                    key_hash = hashlib.sha256(key_str.encode()).hexdigest()
-                    if duplicate_parent_xpath and self.is_child_xpath(
-                        duplicate_parent_xpath, xpath
-                    ):
-                        logging.info(
-                            f"[Worker {worker_id}] Skipping element inside duplicate parent: {xpath} in {url}"
-                        )
-                        navigation = self.navigatable_elements.get(key_hash)
-                        if navigation:
-                            logging.info(
-                                f"[Worker {worker_id}] Found previous navigation for duplicate element: {navigation}"
-                            )
-                            element_data["navigated_to"] = navigation
-                        visible_elements.append(element_data)
-                        continue
-                    elif element_data_include_child_text in self.unique_element:
-                        duplicate_parent_xpath = xpath
-                        logging.info(
-                            f"[Worker {worker_id}] Duplicate element skipped: {xpath} in {url}"
-                        )
-                        # Check if we have navigation info for this duplicate
-                        navigation = self.navigatable_elements.get(key_hash)
-                        if navigation:
-                            logging.info(
-                                f"[Worker {worker_id}] Found previous navigation for duplicate element: {navigation}"
-                            )
-                            element_data["navigated_to"] = navigation
-                        visible_elements.append(element_data)
-                        continue
-                    else:
-                        self.unique_element.append(element_data_include_child_text)
-
-                    # clickable check
-                    if (
-                        await self.is_probably_clickable(element)
-                        and await element.is_enabled()
-                        and not self.is_child_xpath(parent_xpath, xpath)
-                    ):
-                        href = attrs.get("href")
-                        if tag.lower() == "a" and self.should_skip_link(
-                            previous_url, href
-                        ):
-                            continue
-
-                        element_handle = page.locator(f"xpath={xpath}").first
-                        handle = await element_handle.element_handle()
-                        if not handle:
-                            continue
-
-                        logging.info(f"[Worker {worker_id}] Clicking element: {xpath}")
-
-                        # Set up new page detection BEFORE clicking
-                        new_page_future = asyncio.Future()
-
-                        def on_popup(popup):
-                            if not new_page_future.done():
-                                new_page_future.set_result(popup)
-
-                        # Register the popup listener
-                        page.on("popup", on_popup)
-
-                        try:
-                            # Optional: Use click lock for extra safety
-                            # async with self.click_lock:
-
-                            # getting the dom details before clicking
-                            dom_before = await page.evaluate(
-                                "document.documentElement.outerHTML"
-                            )
-
-                            # Click the element
-                            await handle.evaluate("(el) => el.click()")
-                            parent_xpath = xpath
-                            clciked_xpaths.append(xpath)
-
-                            # Wait for popup with timeout
-                            try:
-                                new_tab = await asyncio.wait_for(
-                                    new_page_future, timeout=2.0
-                                )
-                                self.worker_pages[worker_id].add(new_tab)
-
-                                await new_tab.wait_for_load_state("domcontentloaded")
-                                new_url = new_tab.url
-                                logging.info(
-                                    f"[Worker {worker_id}] Detected new tab: {new_url}"
-                                )
-                                element_data["opened_new_tab"] = new_url
-                                self.navigatable_elements[key_hash] = new_url
-                                if not self.should_skip_link(previous_url, new_url):
-                                    already_scraped = await self.state.has_scraped_url(
-                                        new_url
-                                    )
-                                    if not already_scraped:
-                                        await self.to_visit.put(new_url)
-                                        await self.update_stats("urls_queued")
-                                        logging.info(
-                                            f"[Worker {worker_id}] Queued new tab: {new_url}"
-                                        )
-
-                                try:
-                                    await new_tab.close()
-                                    self.worker_pages[worker_id].discard(new_tab)
-                                    logging.info(
-                                        f"[Worker {worker_id}] Closed new tab: {new_url}"
-                                    )
-                                except Exception as e:
-                                    logging.warning(
-                                        f"[Worker {worker_id}] Could not close tab: {e}"
-                                    )
-
-                                await page.bring_to_front()
-                                await self.wait_until_ready(
-                                    page, timeout=10, settle_time=1.0
-                                )
-
-                            except asyncio.TimeoutError:
-                                # No popup opened, check for same-tab navigation
-                                logging.info(
-                                    f"[Worker {worker_id}] No popup detected, checking for navigation"
-                                )
-
-                                await page.wait_for_load_state(
-                                    "domcontentloaded", timeout=30000
-                                )
-                                await self.wait_until_ready(
-                                    page, timeout=15, settle_time=1
-                                )
-
-                                if page.url != previous_url:
-                                    new_url = page.url.split("?")[0].split("#")[0]
-                                    element_data["navigated_to"] = new_url
-                                    self.navigatable_elements[key_hash] = new_url
-                                    logging.info(
-                                        f"[Worker {worker_id}] Detected same-tab navigation to: {new_url}"
-                                    )
-                                    if not self.should_skip_link(previous_url, new_url):
-                                        already_scraped = (
-                                            await self.state.has_scraped_url(new_url)
-                                        )
-                                        if not already_scraped:
-                                            await self.to_visit.put(new_url)
-                                            await self.update_stats("urls_queued")
-                                            logging.info(
-                                                f"[Worker {worker_id}] Queued navigation: {new_url}"
-                                            )
-                                        else:
-                                            logging.info(
-                                                f"[Worker {worker_id}] Navigation URL already scraped: {new_url}"
-                                            )
-
-                                    await page.go_back()
-                                    await self.wait_until_ready(
-                                        page, timeout=15, settle_time=1
-                                    )
-                                else:
-                                    logging.info(
-                                        f"[Worker {worker_id}] No navigation occurred after click."
-                                    )
-                                    dom_after = await page.evaluate(
-                                        "document.documentElement.outerHTML"
-                                    )
-                                    if dom_before != dom_after:
-                                        if previous_element_xpath is None:
-                                            previous_element_xpath = (
-                                                clciked_xpaths[
-                                                    clciked_xpaths.index(xpath) - 1
-                                                ]
-                                                if clciked_xpaths.index(xpath) > 0
-                                                else None
-                                            )
-                                        logging.info(
-                                            f"[Worker {worker_id}] DOM changed after click on {xpath} in {url}."
-                                        )
-                                        soup_old = BeautifulSoup(
-                                            dom_before, "html.parser"
-                                        )
-                                        soup_new = BeautifulSoup(
-                                            dom_after, "html.parser"
-                                        )
-
-                                        old_elements = self.extract_dom_structure(
-                                            soup_old
-                                        )
-                                        new_elements = self.extract_dom_structure(
-                                            soup_new
-                                        )
-
-                                        changes = self.compare_doms(
-                                            old_elements, new_elements, True
-                                        )
-
-                                        if changes["added"]:
-                                            logging.info("internal routes detected ")
-                                            element_data["internal_routes"] = changes[
-                                                "added"
-                                            ]
-
-                                        previous_element = (
-                                            await page.query_selector(
-                                                f"xpath={previous_element_xpath}"
-                                            )
-                                            if previous_element_xpath
-                                            else None
-                                        )
-                                        if previous_element:
-                                            logging.info(
-                                                f"[Worker {worker_id}] Returning to previous element {previous_element_xpath} after DOM change."
-                                            )
-                                            await previous_element.evaluate(
-                                                "(el) => el.click()"
-                                            )
-                                            await self.wait_until_ready(
-                                                page, timeout=15, settle_time=1
-                                            )
-
-                                        else:
-                                            logging.info(
-                                                f"[Worker {worker_id}] No previous element to return to after DOM change so clciking the same elements."
-                                            )
-                                            await element.evaluate("(el) => el.click()")
-                                            await self.wait_until_ready(
-                                                page, timeout=15, settle_time=1
-                                            )
-                                    else:
-                                        logging.info(
-                                            f"[Worker {worker_id}] DOM did not change after click on {xpath} in {url}."
-                                        )
-                                        previous_element_xpath = None
-
-                        finally:
-                            # Remove the popup listener
-                            page.remove_listener("popup", on_popup)
-                    visible_elements.append(element_data)
-
-                except Exception as e:
-                    logging.error(
-                        f"[Worker {worker_id}] Error processing element {xpath}: {e}"
-                    )
-                    await self.update_stats("errors")
-                    continue
+            logging.info(
+                f"Worker {worker_id}: Found {len(xpaths)} visible elements on {url}"
+            )
+            visible_elements = await self.details_from_thre_xpath(
+                xpaths, page, url, worker_id
+            )
 
             page_details["elements"] = visible_elements
             await self.state.add_result(page_details)
@@ -671,10 +378,343 @@ class RecursiveScraper:
                 except Exception as e:
                     logging.error(f"[Worker {worker_id}] Error closing page: {e}")
 
-    def extract_dom_structure(self, soup):
+    async def details_from_thre_xpath(self, xpaths, page, url, worker_id):
+        # to avoid click both parent and child elements
+        previous_url = page.url
+        parent_xpath = None
+        duplicate_parent_xpath = None
+        previous_element_xpath = None
+        visible_elements = []
+        clciked_xpaths = []
+        for xpath in xpaths:
+            await self.pause_event.wait()
+            try:
+                element = await page.query_selector(f"xpath={xpath}")
+                if not element:
+                    continue
+
+                tag = await element.evaluate("(el) => el.tagName")
+                if tag.lower() in ["script", "style", "meta", "link", "noscript"]:
+                    continue
+
+                attrs = await element.evaluate(
+                    "(el) => { let a = {}; for (let attr of el.attributes) a[attr.name] = attr.value; return a; }"
+                )
+                direct_text = await element.evaluate(
+                    """
+                    (el) => Array.from(el.childNodes)
+                        .filter(n => n.nodeType === Node.TEXT_NODE)
+                        .map(n => n.textContent.trim())
+                        .filter(t => t.length > 0)
+                        .join(' ')
+                    """
+                )
+
+                element_data = {
+                    "tag": tag.lower(),
+                    "text": direct_text,
+                    "attributes": attrs,
+                    "xpath": xpath,
+                }
+
+                all_text = await element.evaluate("(el) => el.innerText || ''")
+
+                # comparing all the text including child elements to avoid duplicates and check modifications
+                element_data_include_child_text = {
+                    "tag": tag.lower(),
+                    "text": direct_text,
+                    "attributes": attrs,
+                    "xpath": xpath,
+                    "all_text": all_text,
+                }
+
+                attrs_sorted = sorted(attrs.items())
+                # Combine all element info into a list
+                key_list = [tag.lower(), xpath, direct_text, attrs_sorted]
+
+                # Serialize to JSON string
+                key_str = json.dumps(key_list, sort_keys=True)
+
+                # Create hashcode
+                key_hash = hashlib.sha256(key_str.encode()).hexdigest()
+                if duplicate_parent_xpath and await self.is_child_xpath(
+                    duplicate_parent_xpath, xpath
+                ):
+                    logging.info(
+                        f"[Worker {worker_id}] Skipping element inside duplicate parent: {xpath} in {url}"
+                    )
+                    navigation = self.navigatable_elements.get(key_hash)
+                    if navigation:
+                        logging.info(
+                            f"[Worker {worker_id}] Found previous navigation for duplicate element: {navigation}"
+                        )
+                        element_data["navigated_to"] = navigation
+                    visible_elements.append(element_data)
+                    continue
+                elif element_data_include_child_text in self.unique_element:
+                    duplicate_parent_xpath = xpath
+                    logging.info(
+                        f"[Worker {worker_id}] Duplicate element skipped: {xpath} in {url}"
+                    )
+                    # Check if we have navigation info for this duplicate
+                    navigation = self.navigatable_elements.get(key_hash)
+                    if navigation:
+                        logging.info(
+                            f"[Worker {worker_id}] Found previous navigation for duplicate element: {navigation}"
+                        )
+                        element_data["navigated_to"] = navigation
+                    visible_elements.append(element_data)
+                    continue
+                else:
+                    self.unique_element.append(element_data_include_child_text)
+
+                # clickable check
+                if (
+                    await self.is_probably_clickable(element)
+                    and await element.is_enabled()
+                    and not await self.is_child_xpath(parent_xpath, xpath)
+                ):
+                    
+                    hovered=await self.safe_hover(page, element, xpath, worker_id)
+                    if not hovered:
+                        logging.info(f"[Worker {worker_id}] Could not hover over element: {xpath} in {url}")
+                    else:
+                        logging.info(f"[Worker {worker_id}] Hovered over element: {xpath} in {url}")
+                        
+                    href = attrs.get("href")
+                    if tag.lower() == "a" and await self.should_skip_link(previous_url, href):
+                        continue
+
+                    element_handle = page.locator(f"xpath={xpath}").first
+                    handle = await element_handle.element_handle()
+                    if not handle:
+                        continue
+
+                    logging.info(f"[Worker {worker_id}] Clicking element: {xpath} in {url}")
+
+                    # Set up new page detection BEFORE clicking
+                    new_page_future = asyncio.Future()
+
+                    def on_popup(popup):
+                        if not new_page_future.done():
+                            new_page_future.set_result(popup)
+
+                    # Register the popup listener
+                    page.on("popup", on_popup)
+
+                    try:
+                        # Optional: Use click lock for extra safety
+                        # async with self.click_lock:
+
+                        # getting the dom details before clicking
+                        dom_before = await page.evaluate(
+                            "document.documentElement.outerHTML"
+                        )
+
+                        # Click the element
+                        await handle.evaluate("(el) => el.click()")
+                        parent_xpath = xpath
+                        clciked_xpaths.append(xpath)
+
+                        # Wait for popup with timeout
+                        try:
+                            new_tab = await asyncio.wait_for(
+                                new_page_future, timeout=2.0
+                            )
+                            self.worker_pages[worker_id].add(new_tab)
+
+                            await new_tab.wait_for_load_state("domcontentloaded")
+                            new_url = new_tab.url
+                            logging.info(
+                                f"[Worker {worker_id}] Detected new tab: {new_url}"
+                            )
+                            element_data["opened_new_tab"] = new_url
+                            self.navigatable_elements[key_hash] = new_url
+                            if not await self.should_skip_link(previous_url, new_url):
+                                already_scraped = await self.state.has_scraped_url(
+                                    new_url
+                                )
+                                if not already_scraped:
+                                    await self.to_visit.put(new_url)
+                                    await self.update_stats("urls_queued")
+                                    logging.info(
+                                        f"[Worker {worker_id}] Queued new tab: {new_url}"
+                                    )
+
+                            try:
+                                await new_tab.close()
+                                self.worker_pages[worker_id].discard(new_tab)
+                                logging.info(
+                                    f"[Worker {worker_id}] Closed new tab: {new_url}"
+                                )
+                            except Exception as e:
+                                logging.warning(
+                                    f"[Worker {worker_id}] Could not close tab: {e}"
+                                )
+
+                            await page.bring_to_front()
+                            await self.wait_until_ready(
+                                page, timeout=10, settle_time=1.0
+                            )
+
+                        except asyncio.TimeoutError:
+                            # No popup opened, check for same-tab navigation
+                            logging.info(
+                                f"[Worker {worker_id}] No popup detected, checking for navigation"
+                            )
+
+                            await page.wait_for_load_state(
+                                "domcontentloaded", timeout=30000
+                            )
+                            await self.wait_until_ready(page, timeout=15, settle_time=1)
+
+                            if page.url != previous_url:
+                                new_url = page.url.split("?")[0].split("#")[0]
+                                element_data["navigated_to"] = new_url
+                                self.navigatable_elements[key_hash] = new_url
+                                logging.info(
+                                    f"[Worker {worker_id}] Detected same-tab navigation to: {new_url}"
+                                )
+                                if not await self.should_skip_link(previous_url, new_url):
+                                    already_scraped = await self.state.has_scraped_url(
+                                        new_url
+                                    )
+                                    if not already_scraped:
+                                        await self.to_visit.put(new_url)
+                                        await self.update_stats("urls_queued")
+                                        logging.info(
+                                            f"[Worker {worker_id}] Queued navigation: {new_url}"
+                                        )
+                                    else:
+                                        logging.info(
+                                            f"[Worker {worker_id}] Navigation URL already scraped: {new_url}"
+                                        )
+
+                                await page.go_back()
+                                await self.wait_until_ready(
+                                    page, timeout=15, settle_time=1
+                                )
+                            else:
+                                logging.info(
+                                    f"[Worker {worker_id}] No navigation occurred after click."
+                                )
+                                dom_after = await page.evaluate(
+                                    "document.documentElement.outerHTML"
+                                )
+                                if dom_before != dom_after:
+                                    if previous_element_xpath is None:
+                                        previous_element_xpath = (
+                                            clciked_xpaths[
+                                                clciked_xpaths.index(xpath) - 1
+                                            ]
+                                            if clciked_xpaths.index(xpath) > 0
+                                            else None
+                                        )
+                                    logging.info(
+                                        f"[Worker {worker_id}] DOM changed after click on {xpath} in {url}."
+                                    )
+                                    soup_old = BeautifulSoup(dom_before, "html.parser")
+                                    soup_new = BeautifulSoup(dom_after, "html.parser")
+
+                                    old_elements = await self.extract_dom_structure(soup_old)
+                                    new_elements = await self.extract_dom_structure(soup_new)
+
+                                    changes = await self.compare_doms(
+                                        old_elements, new_elements,worker_id, True
+                                    )
+
+                                    if changes["added"]:
+                                        logging.info(f"Worker {worker_id}:  internal routes detected in {url} ")
+                                        changed_xpaths = changes[
+                                            "added"
+                                        ]
+                                        element_data["internal_routes"]=await self.details_from_thre_xpath(
+                                            changed_xpaths, page, url, worker_id)
+                                    previous_element = (
+                                        await page.query_selector(
+                                            f"xpath={previous_element_xpath}"
+                                        )
+                                        if previous_element_xpath
+                                        else None
+                                    )
+                                    if previous_element:
+                                        logging.info(
+                                            f"[Worker {worker_id}] Returning to previous element {previous_element_xpath} after DOM change."
+                                        )
+                                        await previous_element.evaluate(
+                                            "(el) => el.click()"
+                                        )
+                                        await self.wait_until_ready(
+                                            page, timeout=15, settle_time=1
+                                        )
+
+                                    else:
+                                        logging.info(
+                                            f"[Worker {worker_id}] No previous element to return to after DOM change so clciking the same elements."
+                                        )
+                                        await element.evaluate("(el) => el.click()")
+                                        await self.wait_until_ready(
+                                            page, timeout=15, settle_time=1
+                                        )
+                                else:
+                                    logging.info(
+                                        f"[Worker {worker_id}] DOM did not change after click on {xpath} in {url}."
+                                    )
+                                    previous_element_xpath = None
+
+                    finally:
+                        # Remove the popup listener
+                        page.remove_listener("popup", on_popup)
+                visible_elements.append(element_data)
+
+            except Exception as e:
+                logging.error(
+                    f"[Worker {worker_id}] Error processing element {xpath}: {e}"
+                )
+                await self.update_stats("errors")
+                continue
+
+        return visible_elements
+    async def safe_hover(self, page, element, xpath, worker_id):
+        """Safely hover over an element using Playwright with fallback strategies."""
+        try:
+            # ✅ Strategy 1: Scroll into view and hover normally
+            await element.scroll_into_view_if_needed(timeout=2000)
+            await page.wait_for_timeout(200)  # small delay for stability
+            await element.hover()
+            logging.info(f"[Worker {worker_id}] Hovered over element: {xpath}")
+            await page.wait_for_timeout(300)  # allow any hover-triggered UI to appear
+            return True
+
+        except Exception as e:
+            logging.warning(f"[Worker {worker_id}] Normal hover failed for {xpath}: {e}")
+
+            # ✅ Strategy 2: Fallback to JS-dispatched hover event
+            try:
+                await page.evaluate(
+                    """
+                    (el) => {
+                        const event = new MouseEvent('mouseover', {
+                            bubbles: true,
+                            cancelable: true,
+                            view: window
+                        });
+                        el.dispatchEvent(event);
+                    }
+                    """,
+                    element,
+                )
+                await page.wait_for_timeout(200)
+                logging.info(f"[Worker {worker_id}] Hovered using JS dispatch: {xpath}")
+                return True
+            except Exception as js_e:
+                logging.error(f"[Worker {worker_id}] JS hover fallback failed for {xpath}: {js_e}")
+                return False
+            
+    async def extract_dom_structure(self, soup):
         elements = []
         for element in soup.find_all(True):  # True = all tags
-            xpath = self.get_xpath_bs(element)
+            xpath =await self.get_xpath_bs(element)
 
             normalized_attrs = {}
             for k, v in element.attrs.items():
@@ -694,7 +734,7 @@ class RecursiveScraper:
             elements.append(data)
         return elements
 
-    def get_xpath_bs(self, el):
+    async def get_xpath_bs(self, el):
         parts = []
         while el and getattr(el, "name", None):
             parent = el.parent
@@ -733,9 +773,9 @@ class RecursiveScraper:
 
         return "/" + "/".join(parts)
 
-    def compare_doms(self, old, new, is_include_text=False):
+    async def compare_doms(self, old, new,worker_id, is_include_text=False):
         # Filter out <body> elements
-        logging.info("comparing doms to detect changes")
+        logging.info(f"Worker {worker_id}: comparing doms to detect changes")
         old_filtered = [e for e in old if e["tag"].lower() != "body"]
         new_filtered = [e for e in new if e["tag"].lower() not in ["body", "style"]]
 
@@ -753,17 +793,17 @@ class RecursiveScraper:
                 for e in new_filtered
                 if (e["xpath"], e["text"]) not in old_set
             ]
-            logging.info(f"added elements with text {added}")
+            logging.info(f"Worker {worker_id}: Found added elements with text {added}")
             return {"added": added}
 
         old_set = {(e["xpath"]) for e in old_filtered}
 
         # Keep the order of new elements
         added = [(e["xpath"]) for e in new_filtered if (e["xpath"]) not in old_set]
-        logging.info(f"added elements {added}")
+        logging.info(f"Worker {worker_id}: Found added elements {added}")
         return {"added": added}
 
-    def is_child_xpath(self, parent_xpath, child_xpath):
+    async def is_child_xpath(self, parent_xpath, child_xpath):
         """
         Returns True if parent_xpath is a prefix of child_xpath
         (i.e., child_xpath is inside parent_xpath)
