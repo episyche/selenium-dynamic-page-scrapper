@@ -1,5 +1,9 @@
 import asyncio
-from playwright.async_api import async_playwright
+from playwright.async_api import (
+    async_playwright,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+)
 import json
 import logging
 import os
@@ -14,7 +18,6 @@ import re
 # import sqlite3
 import aiosqlite
 from bs4 import BeautifulSoup
-from datetime import datetime
 
 # --- logging setup (ensure directory exists) ---
 os.makedirs("logs", exist_ok=True)
@@ -172,6 +175,17 @@ class RecursiveScraper:
             }
             """
         self.avoid_page = avoid_page or []
+        self.avoid_buttons = [
+            "logout",
+            "log out",
+            "sign out",
+            "signout",
+            "delete",
+            "remove",
+            "cancel",
+            "close account",
+            "deactivate",
+        ]
 
         # Add statistics tracking
         self.stats_lock = asyncio.Lock()
@@ -354,6 +368,9 @@ class RecursiveScraper:
             logging.info(
                 f"Worker {worker_id}: Found {len(all_elements)} elements on {url}"
             )
+            popups = await self.detect_and_handle_popups(page, worker_id)
+            if popups:
+                page_details["popups"] = popups
 
             xpaths = []
 
@@ -508,6 +525,16 @@ class RecursiveScraper:
                     dom_before_hover_visible = await page.evaluate(
                         self.script_visible_element
                     )
+                    processed_text = (
+                        await element.evaluate("(el) => el.innerText || ''")
+                    )[:100].lower()
+                    if any(word in processed_text for word in self.avoid_buttons):
+                        logging.info(
+                            f"[Worker {worker_id}] Skipping click on avoid button element: {xpath} in {url}"
+                        )
+                        visible_elements.append(element_data)
+                        parent_xpath = xpath
+                        continue
                     hovered = await self.safe_hover(page, element, xpath, worker_id)
                     if not hovered:
                         logging.info(
@@ -671,13 +698,13 @@ class RecursiveScraper:
 
                                 if dom_before_visible != dom_after_visible:
                                     if previous_element_xpath is None:
-                                            previous_element_xpath = (
-                                                clciked_xpaths[
-                                                    clciked_xpaths.index(xpath) - 1
-                                                ]
-                                                if clciked_xpaths.index(xpath) > 0
-                                                else None
-                                            )
+                                        previous_element_xpath = (
+                                            clciked_xpaths[
+                                                clciked_xpaths.index(xpath) - 1
+                                            ]
+                                            if clciked_xpaths.index(xpath) > 0
+                                            else None
+                                        )
                                     logging.info(
                                         f"[Worker {worker_id}] DOM changed after click on {xpath} in {url}."
                                     )
@@ -712,8 +739,10 @@ class RecursiveScraper:
                                             )
                                         )
                                         if previous_element_xpath:
-                                            previous_element =await page.query_selector(
-                                                f"xpath={previous_element_xpath}"
+                                            previous_element = (
+                                                await page.query_selector(
+                                                    f"xpath={previous_element_xpath}"
+                                                )
                                             )
                                             logging.info(
                                                 f"[Worker {worker_id}] Returning to previous element {previous_element_xpath} after DOM change."
@@ -774,7 +803,9 @@ class RecursiveScraper:
         # --- 1. Normalize timestamps, dates, and times ---
         dom = re.sub(
             r"\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?",
-            "TIMESTAMP", dom)
+            "TIMESTAMP",
+            dom,
+        )
         dom = re.sub(r"\b\d{1,2}:\d{2}(:\d{2})?(\s*[AP]M)?\b", "TIME", dom)
         dom = re.sub(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", "DATE", dom)
 
@@ -791,25 +822,42 @@ class RecursiveScraper:
         dom = re.sub(r'data-[a-zA-Z_-]+="\d+"', 'data-ATTR="DYNAMIC_VALUE"', dom)
 
         # --- 3. Remove security or session identifiers ---
-        dom = re.sub(r'csrf[-_]token["\s:=]+[^"\s<>]+', 'csrf_token="REMOVED"', dom, flags=re.I)
-        dom = re.sub(r'session[-_]id["\s:=]+[^"\s<>]+', 'session_id="REMOVED"', dom, flags=re.I)
+        dom = re.sub(
+            r'csrf[-_]token["\s:=]+[^"\s<>]+', 'csrf_token="REMOVED"', dom, flags=re.I
+        )
+        dom = re.sub(
+            r'session[-_]id["\s:=]+[^"\s<>]+', 'session_id="REMOVED"', dom, flags=re.I
+        )
 
         # --- 4. Replace UUIDs / hashes ---
-        dom = re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "UUID", dom, flags=re.I)
-        dom = re.sub(r'id="[A-Za-z0-9_\-]{12,}"', 'id="DYNAMIC_ID"', dom)  # long alphanumeric IDs
+        dom = re.sub(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            "UUID",
+            dom,
+            flags=re.I,
+        )
+        dom = re.sub(
+            r'id="[A-Za-z0-9_\-]{12,}"', 'id="DYNAMIC_ID"', dom
+        )  # long alphanumeric IDs
 
         # --- 5. Remove script and comment blocks ---
-        dom = re.sub(r"<script[^>]*>.*?</script>", "<script>REMOVED</script>", dom, flags=re.DOTALL)
+        dom = re.sub(
+            r"<script[^>]*>.*?</script>",
+            "<script>REMOVED</script>",
+            dom,
+            flags=re.DOTALL,
+        )
         dom = re.sub(r"<!--.*?-->", "", dom, flags=re.DOTALL)
 
         # --- 6. Replace visible numeric content ---
         # Handles numbers with separators (’, ', comma, dot, underscore, or space)
         dom = re.sub(
             r">(.*?\d[\d’'`,._\s]*\d.*?)<",
-            lambda m: ">" + re.sub(
-                r"\d+", "NUMBER",
-                re.sub(r"(NUMBER[’'`,._\s]*)+", "NUMBER", m.group(1))
-            ) + "<",
+            lambda m: ">"
+            + re.sub(
+                r"\d+", "NUMBER", re.sub(r"(NUMBER[’'`,._\s]*)+", "NUMBER", m.group(1))
+            )
+            + "<",
             dom,
         )
 
@@ -987,6 +1035,45 @@ class RecursiveScraper:
             )
             return False
 
+    async def get_xpath_bs(self, el):
+        parts = []
+        while el and getattr(el, "name", None):
+            parent = el.parent
+
+            # Stop before the document root
+            if not parent or getattr(parent, "name", None) in (
+                None,
+                "[document]",
+            ):
+                parts.append(el.name)
+                break
+
+            # Collect tag siblings in DOM order (ignore strings/comments)
+            same_tag_siblings = [
+                sib for sib in parent.children if getattr(sib, "name", None) == el.name
+            ]
+
+            # Determine index among siblings (1-based like XPath)
+            if len(same_tag_siblings) > 1:
+                try:
+                    index = same_tag_siblings.index(el) + 1
+                    parts.append(f"{el.name}[{index}]")
+                except ValueError:
+                    # fallback if BS made a copy or parsing glitch
+                    parts.append(f"{el.name}[1]")
+            else:
+                parts.append(el.name)
+
+            el = parent
+
+        parts.reverse()
+
+        # Fix duplicate /html/html case
+        if len(parts) >= 2 and parts[0] == "html" and parts[1] == "html":
+            parts = parts[1:]
+
+        return "/" + "/".join(parts)
+
     async def extract_dom_structure(self, soup, created=True):
         elements = []
         for element in soup.find_all(True):  # True = all tags
@@ -1082,8 +1169,227 @@ class RecursiveScraper:
         except Exception as e:
             logging.error(f"Error checking if element is clickable: {e}")
             return False
-        
-    
+
+    async def detect_and_handle_popups(self, page: Page, worker_id: int):
+        """
+        Detect various types of popups and collect their details.
+        Returns popup data if found, None otherwise.
+        """
+        popup_data = None
+
+        try:
+            # --- 1. Modal dialogs ---
+            modal_selectors = [
+                "//div[contains(@class,'modal') and contains(@style,'display: block')]",
+                "//div[@role='dialog']",
+                "//div[contains(@class,'popup')]",
+                "//div[contains(@class,'overlay')]",
+                "//div[contains(@class,'lightbox')]",
+                "//div[contains(@id,'modal')]",
+                "//div[contains(@class,'modal-dialog')]",
+            ]
+
+            for selector in modal_selectors:
+                elements = await page.locator(f"xpath={selector}").element_handles()
+                visible_modals = [el for el in elements if await el.is_visible()]
+
+                if visible_modals:
+                    modal = visible_modals[0]
+                    logging.info(
+                        f"Worker {worker_id} Modal detected using selector: {selector}"
+                    )
+                    popup_data = await self.extract_popup_details(
+                        page, modal, "modal", worker_id
+                    )
+                    await self.close_popup(page, modal, "modal", worker_id)
+                    return popup_data
+
+            # --- 2. Tooltips ---
+            tooltip_selectors = [
+                "//div[contains(@class,'tooltip') and contains(@style,'display: block')]",
+                "//div[@role='tooltip']",
+                "//div[contains(@class,'popover')]",
+            ]
+
+            for selector in tooltip_selectors:
+                elements = await page.locator(f"xpath={selector}").element_handles()
+                visible_tooltips = [el for el in elements if await el.is_visible()]
+
+                if visible_tooltips:
+                    tooltip = visible_tooltips[0]
+                    logging.info(
+                        f"Worker {worker_id} Tooltip detected using selector: {selector}"
+                    )
+                    popup_data = await self.extract_popup_details(
+                        page, tooltip, "tooltip", worker_id
+                    )
+                    await self.close_popup(page, tooltip, "tooltip", worker_id)
+                    return popup_data
+
+            # --- 3. Overlays ---
+            overlay_selectors = [
+                "//div[contains(@style,'z-index') and contains(@style,'position: fixed')]",
+                "//div[contains(@style,'z-index') and contains(@style,'position: absolute')]",
+            ]
+
+            for selector in overlay_selectors:
+                elements = await page.locator(f"xpath={selector}").element_handles()
+                visible_overlays = []
+                for el in elements:
+                    if await el.is_visible():
+                        box = await el.bounding_box()
+                        if box and box["height"] > 50:
+                            visible_overlays.append(el)
+
+                if visible_overlays:
+                    overlay = visible_overlays[0]
+                    logging.info(
+                        f"Worker {worker_id} Overlay detected using selector: {selector}"
+                    )
+                    popup_data = await self.extract_popup_details(
+                        page, overlay, "overlay", worker_id
+                    )
+                    await self.close_popup(page, overlay, "overlay", worker_id)
+                    return popup_data
+
+        except Exception as e:
+            logging.error(f"Error detecting popups: {e}")
+
+        return popup_data
+
+    async def extract_popup_details(
+        self, page: Page, popup_element, popup_type: str, worker_id: int
+    ):
+        """
+        Extract detailed information from a popup element.
+        """
+        try:
+            text = await popup_element.inner_text()
+            popup_data = {
+                "type": popup_type,
+                "text": text.strip(),
+                "classes": await popup_element.get_attribute("class"),
+                "id": await popup_element.get_attribute("id"),
+                "elements": [],
+            }
+
+            # Interactive elements inside popup
+            interactive_xpath = (
+                ".//button | .//a | .//input | .//select | .//textarea | "
+                ".//*[@onclick] | .//*[@role='button']"
+            )
+            elements = await popup_element.query_selector_all(
+                f"xpath={interactive_xpath}"
+            )
+
+            for elem in elements:
+                if await elem.is_visible():
+                    tag = await elem.evaluate("(el) => el.tagName.toLowerCase()")
+                    elem_info = {
+                        "tag": tag,
+                        "text": (await elem.inner_text()).strip(),
+                        "type": await elem.get_attribute("type"),
+                        "href": await elem.get_attribute("href"),
+                        "onclick": await elem.get_attribute("onclick"),
+                        "class": await elem.get_attribute("class"),
+                        "id": await elem.get_attribute("id"),
+                    }
+                    popup_data["elements"].append(elem_info)
+
+            # Extract forms
+            forms = await popup_element.query_selector_all("form")
+            if forms:
+                popup_data["forms"] = []
+                for form in forms:
+                    form_data = {
+                        "action": await form.get_attribute("action"),
+                        "method": await form.get_attribute("method"),
+                        "fields": [],
+                    }
+                    fields = await form.query_selector_all("input, select, textarea")
+                    for field in fields:
+                        field_info = {
+                            "name": await field.get_attribute("name"),
+                            "type": await field.get_attribute("type"),
+                            "placeholder": await field.get_attribute("placeholder"),
+                            "required": await field.get_attribute("required")
+                            is not None,
+                        }
+                        form_data["fields"].append(field_info)
+                    popup_data["forms"].append(form_data)
+
+            return popup_data
+
+        except Exception as e:
+            logging.error(f"Worker {worker_id} Error extracting popup details: {e}")
+            return {
+                "type": popup_type,
+                "text": "Error extracting details",
+                "error": str(e),
+            }
+
+    async def close_popup(
+        self, page: Page, popup_element, popup_type: str, worker_id: int
+    ):
+        """
+        Attempt to close the popup using various methods.
+        """
+        try:
+            close_selectors = [
+                ".//button[contains(text(),'×')]",
+                ".//button[contains(text(),'Close')]",
+                ".//button[normalize-space()='Cancel']",
+                ".//span[contains(@class,'close')]",
+                ".//*[@aria-label='Close']",
+                ".//*[contains(@class,'btn-close')]",
+                ".//*[contains(@data-dismiss,'modal')]",
+            ]
+
+            # Try close buttons first
+            for selector in close_selectors:
+                btn = await popup_element.query_selector(f"xpath={selector}")
+                if btn and await btn.is_visible():
+                    await btn.click()
+                    logging.info(
+                        f"Worker {worker_id} Closed {popup_type} using {selector}"
+                    )
+                    await asyncio.sleep(0.5)
+                    return True
+
+            # Escape key for modals
+            if popup_type in ["modal", "dropdown"]:
+                await page.keyboard.press("Escape")
+                logging.info(f"Worker {worker_id} Closed {popup_type} using Escape key")
+                await asyncio.sleep(0.5)
+                return True
+
+            # Click outside for tooltips/dropdowns
+            if popup_type in ["tooltip", "dropdown"]:
+                await page.mouse.click(10, 10)
+                logging.info(
+                    f"Worker {worker_id} Closed {popup_type} by clicking outside"
+                )
+                await asyncio.sleep(0.5)
+                return True
+
+            # Click overlay background
+            overlay = await page.query_selector(
+                "xpath=//div[contains(@class,'modal-backdrop') or contains(@class,'overlay')]"
+            )
+            if overlay and await overlay.is_visible():
+                await overlay.click()
+                logging.info(
+                    f"Worker {worker_id} Closed {popup_type} by clicking overlay"
+                )
+                await asyncio.sleep(0.5)
+                return True
+
+            logging.warning(f"Worker {worker_id} Could not close {popup_type}")
+            return False
+
+        except Exception as e:
+            logging.error(f"Worker {worker_id} Error closing {popup_type}: {e}")
+            return False
 
     async def worker(self, context, worker_id: int):
         """Worker that takes URLs from queue"""
@@ -1130,13 +1436,89 @@ class RecursiveScraper:
                     pass
                 continue
 
-    async def run(self):
+    async def login_to_website(self,
+        url: str,
+        username: str,
+        password: str,
+        username_selector: str,
+        password_selector: str,
+        login_button_selector: str,
+        wait_for_url_change: bool = True,
+        page: Page = None,
+    ):
+        """
+        Generic login function using Playwright (async)
+
+        Args:
+            url: Website login URL
+            username: Your username/email
+            password: Your password
+            username_selector: CSS or XPath selector for username field
+            password_selector: CSS or XPath selector for password field
+            login_button_selector: CSS or XPath selector for login button
+            wait_for_url_change: Wait for URL to change after login (default: True)
+        """
+        try:
+                print(f"Navigating to: {url}")
+                await page.goto(url, timeout=20000)
+                await page.wait_for_load_state("domcontentloaded")
+
+
+                # Fill username and password fields
+                await page.fill(f"xpath={username_selector}", username)
+                await page.fill(f"xpath={password_selector}", password)
+
+                # Click the login button
+                await page.click(f"xpath={login_button_selector}")
+
+                # Optional: Wait for URL to change after login
+                if wait_for_url_change:
+                    try:
+                        await page.wait_for_url(
+                            lambda current: current != url, timeout=10000
+                        )
+                    except PlaywrightTimeoutError:
+                        print("⚠️ Login completed, but URL did not change.")
+
+                print("✅ Login successful!")
+                return page  # Keep browser open for reuse
+
+        except Exception as e:
+            print(f"❌ Login failed: {str(e)}")
+            return None, None
+
+    async def run(
+        self,
+        login_url: str = None,
+        username: str = None,
+        password: str = None,
+        username_selector: str = None,
+        password_selector: str = None,
+        login_button_selector: str = None,
+    ):
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=False,
                 args=["--disable-web-security", "--window-size=1920,1080"],
             )
             context = await browser.new_context()
+            if login_url:
+                logging.info(f"Logging in to {login_url}...")
+                page= await self.login_to_website(
+                    url=login_url,
+                    username=username,
+                    password=password,
+                    username_selector=username_selector,
+                    password_selector=password_selector,
+                    login_button_selector=login_button_selector,
+                    page=await context.new_page()
+                )
+                if page is None:
+                    logging.error("Login failed, aborting scraper.")
+                    return
+                await context.add_cookies(await page.context.cookies())
+                await page.close()
+                logging.info("Login successful, starting scraper...")
 
             # Add initial URL to queue
             await self.to_visit.put(self.start_url)
@@ -1212,4 +1594,16 @@ class RecursiveScraper:
 
 
 if __name__ == "__main__":
-    asyncio.run(RecursiveScraper("http://localhost:3000/", max_concurrency=5).run())
+    # asyncio.run(
+    #     RecursiveScraper("https://app.instantly.ai/app/accounts", max_concurrency=5).run(
+    #         "https://app.instantly.ai/auth/login",
+    #         "sabarish@episyche.com",
+    #         "Test@123!",
+    #         "/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[1]/input",
+    #         "/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[2]/input",
+    #         "/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[2]/div[1]/button",
+    #     )
+    # )
+
+    asyncio.run(
+        RecursiveScraper("http://localhost:3000", max_concurrency=5).run())
