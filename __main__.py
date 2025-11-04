@@ -26,19 +26,19 @@ def main():
     # time.sleep(5)
     # print("running Scrapping whole page")
 
-    driver = homepage_login(
-        "https://webopt.ai/",
-        "/html/body/div[1]/header/nav/div[3]/div/div/p",
-        "vahak77251@bllibl.com",
-        "Test@12345",
-        "emailId",
-        "passwordId",
-        "//button[@type='submit' and contains(@class, 'bg-gradient-to-r') and contains(text(), 'Log In')]",
-    )
-    time.sleep(5)
-    print("running Scrapping whole page")
+    # driver = homepage_login(
+    #     "https://webopt.ai/",
+    #     "/html/body/div[1]/header/nav/div[3]/div/div/p",
+    #     "vahak77251@bllibl.com",
+    #     "Test@12345",
+    #     "emailId",
+    #     "passwordId",
+    #     "//button[@type='submit' and contains(@class, 'bg-gradient-to-r') and contains(text(), 'Log In')]",
+    # )
+    # time.sleep(5)
+    # print("running Scrapping whole page")
 
-    finder = WebElementFinder(args.website_source,driver=driver,avoid_pages=["tools"]) #include driver from login for same driver
+    finder = WebElementFinder(args.website_source,avoid_pages=["tools"]) #include driver from login for same driver
     urls=[]
     finder.find_all_elements_dynamic()
     website=finder.whole_website
