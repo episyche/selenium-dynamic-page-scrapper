@@ -2,6 +2,7 @@ import asyncio
 from playwright.async_api import (
     async_playwright,
     Page,
+    Locator,
     TimeoutError as PlaywrightTimeoutError,
 )
 import json
@@ -32,9 +33,11 @@ logging.basicConfig(
 @dataclass
 class ThreadSafeState:
     """Thread-safe state container using asyncio locks"""
-
+    
     scraped_urls: Set[str] = field(default_factory=set)
     results_all: List[Dict] = field(default_factory=list)
+    unique_element_hashes: Set[str] = field(default_factory=set)
+    navigatable_elements: Dict[str, str] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def add_scraped_url(self, url: str, helper_id) -> bool:
@@ -63,6 +66,27 @@ class ThreadSafeState:
             logging.info(
                 f"helper {helper_id} Added result for URL: {result.get('url', 'unknown')} (Total results: {len(self.results_all)})"
             )
+            
+    async def add_unique_hash(self, key_hash: str) -> bool:
+        """
+        Add element hash to set. Returns True if added, False if already exists.
+        Thread-safe operation.
+        """
+        async with self._lock:
+            if key_hash in self.unique_element_hashes:
+                return False
+            self.unique_element_hashes.add(key_hash)
+            return True
+
+    async def get_navigation(self, key_hash: str) -> Optional[str]:
+        """Get a cached navigation URL for a given element hash. Thread-safe."""
+        async with self._lock:
+            return self.navigatable_elements.get(key_hash)
+
+    async def add_navigation(self, key_hash: str, url: str):
+        """Cache a navigation URL for a given element hash. Thread-safe."""
+        async with self._lock:
+            self.navigatable_elements[key_hash] = url
 
     async def get_results_copy(self) -> List[Dict]:
         """Get a copy of all results. Thread-safe operation."""
@@ -145,9 +169,9 @@ class RecursiveScraper:
         self.pause_event = asyncio.Event()
         self.pause_event.set()  # Initially not paused
         self.helper_pages: Dict[int, Set] = {}
-        self.unique_element = []
+        # self.unique_element = []
 
-        self.navigatable_elements = {}
+        # self.navigatable_elements = {}
 
         # Replace shared state with thread-safe container
         self.state = ThreadSafeState()
@@ -228,7 +252,7 @@ class RecursiveScraper:
 
         # Convert relative to absolute
         abs_url = urljoin(current_url, href)
-        # abs_url = abs_url.split("?")[0]
+        abs_url = abs_url.split("?")[0]
         abs_url = abs_url.split("#")[0]
 
         parsed_abs = urlparse(abs_url)
@@ -350,37 +374,25 @@ class RecursiveScraper:
                 page, timeout=15, settle_time=1, helper_id=helper_id
             )
 
-            body = await page.query_selector("body")
-            if not body:
-                logging.warning(f"helper {helper_id}: No body tag found on {url}")
-                return
+            
 
-            all_elements = await body.query_selector_all("*")
             page_details = {
                 "title": await page.title(),
                 "url": page.url,
                 "elements": [],
             }
-            logging.info(
-                f"helper {helper_id}: Found {len(all_elements)} elements on {url}"
-            )
+
             popups = await self.detect_and_handle_popups(page, helper_id)
             if popups:
                 page_details["popups"] = popups
 
-            xpaths = []
-
-            # collect all the xpath of visible elements
-            for element in all_elements:
-                if await element.is_visible():
-                    xpath = await element.evaluate(self.get_xpath_js)
-                    xpaths.append(xpath)
-            visible_elements_xpaths = xpaths
+            visible_elements_xpaths = await self.get_visible_elements_xpaths(page=page,helper_id=helper_id)
             logging.info(
-                f"helper {helper_id}: Found {len(xpaths)} visible elements on {url}"
+                f"helper {helper_id}: Found {len(visible_elements_xpaths)} visible elements on {url}"
             )
+
             visible_elements = await self.details_from_thre_xpath(
-                xpaths, page, url, helper_id, visible_elements_xpaths
+                visible_elements_xpaths, page, url, helper_id, visible_elements_xpaths
             )
 
             page_details["elements"] = visible_elements
@@ -430,13 +442,23 @@ class RecursiveScraper:
             await self.pause_event.wait()
             try:
                 if hover_element:
-                    await self.safe_hover(page, hover_element, xpath, helper_id)
-                element = await page.query_selector(f"xpath={xpath}")
-                if not element:
+                    await self.safe_hover(
+                        page,
+                        hover_element,
+                        helper_id=helper_id,
+                    )
+                    logging.info(
+                        f"[helper {helper_id}] Hovered over hover_element before processing: {await hover_element.evaluate(self.get_xpath_js)} in {url} for {xpath}"
+                    )
+                element = page.locator(f"xpath={xpath}").first
+                if not await element.count():
+                    logging.warning(
+                        f"[helper {helper_id}] Element not found for XPath: {xpath} in {url}"
+                    )
                     continue
 
-                tag = await element.evaluate("(el) => el.tagName")
-                if tag.lower() in ["script", "style", "meta", "link", "noscript"]:
+                tag = (await element.evaluate("(el) => el.tagName")).lower()
+                if tag in ["script", "style", "meta", "link", "noscript"]:
                     continue
 
                 attrs = await element.evaluate(
@@ -453,7 +475,7 @@ class RecursiveScraper:
                 )
 
                 element_data = {
-                    "tag": tag.lower(),
+                    "tag": tag,
                     "text": direct_text,
                     "attributes": attrs,
                     "xpath": xpath,
@@ -463,7 +485,7 @@ class RecursiveScraper:
 
                 # comparing all the text including child elements to avoid duplicates and check modifications
                 element_data_include_child_text = {
-                    "tag": tag.lower(),
+                    "tag": tag,
                     "text": direct_text,
                     "attributes": attrs,
                     "xpath": xpath,
@@ -472,7 +494,7 @@ class RecursiveScraper:
 
                 attrs_sorted = sorted(attrs.items())
                 # Combine all element info into a list
-                key_list = [tag.lower(), xpath, direct_text, attrs_sorted]
+                key_list = [tag, xpath, direct_text, attrs_sorted,all_text]
 
                 # Serialize to JSON string
                 key_str = json.dumps(key_list, sort_keys=True)
@@ -483,9 +505,9 @@ class RecursiveScraper:
                     duplicate_parent_xpath, xpath
                 ):
                     logging.info(
-                        f"[helper {helper_id}] Skipping element inside duplicate parent: {xpath} in {url}"
+                        f"[helper {helper_id}] Skipping element inside duplicate parent: {xpath} in {url} for {element_data_include_child_text}"
                     )
-                    navigation = self.navigatable_elements.get(key_hash)
+                    navigation = await self.state.get_navigation(key_hash)
                     if navigation:
                         logging.info(
                             f"[helper {helper_id}] Found previous navigation for duplicate element: {navigation}"
@@ -493,13 +515,14 @@ class RecursiveScraper:
                         element_data["navigated_to"] = navigation
                     visible_elements.append(element_data)
                     continue
-                elif element_data_include_child_text in self.unique_element:
+                was_added = await self.state.add_unique_hash(key_hash)
+                if not was_added:
                     duplicate_parent_xpath = xpath
                     logging.info(
-                        f"[helper {helper_id}] Duplicate element skipped: {xpath} in {url}"
+                        f"[helper {helper_id}] Duplicate element skipped: {xpath} in {url} for {element_data_include_child_text} "
                     )
                     # Check if we have navigation info for this duplicate
-                    navigation = self.navigatable_elements.get(key_hash)
+                    navigation = await self.state.get_navigation(key_hash)
                     if navigation:
                         logging.info(
                             f"[helper {helper_id}] Found previous navigation for duplicate element: {navigation}"
@@ -508,7 +531,8 @@ class RecursiveScraper:
                     visible_elements.append(element_data)
                     continue
                 else:
-                    self.unique_element.append(element_data_include_child_text)
+                    # Not a duplicate, so clear the duplicate parent tracker
+                    duplicate_parent_xpath = None
 
                 # clickable check
                 if (
@@ -524,7 +548,7 @@ class RecursiveScraper:
                     )
                     processed_text = (
                         await element.evaluate("(el) => el.innerText || ''")
-                    )[:100].lower()
+                    )[:30].lower()
                     if any(word in processed_text for word in self.avoid_buttons):
                         logging.info(
                             f"[helper {helper_id}] Skipping click on avoid button element: {xpath} in {url}"
@@ -532,7 +556,7 @@ class RecursiveScraper:
                         visible_elements.append(element_data)
                         parent_xpath = xpath
                         continue
-                    hovered = await self.safe_hover(page, element, xpath, helper_id)
+                    hovered = await self.safe_hover(page, element, helper_id)
                     if not hovered:
                         logging.info(
                             f"[helper {helper_id}] Could not hover over element: {xpath} in {url}"
@@ -557,16 +581,9 @@ class RecursiveScraper:
                     if tag.lower() == "a" and await self.should_skip_link(
                         previous_url, href, helper_id
                     ):
+                        visible_elements.append(element_data)
+                        parent_xpath = xpath
                         continue
-
-                    element_handle = page.locator(f"xpath={xpath}").first
-                    handle = await element_handle.element_handle()
-                    if not handle:
-                        continue
-
-                    logging.info(
-                        f"[helper {helper_id}] Clicking element: {xpath} in {url}"
-                    )
 
                     # Set up new page detection BEFORE clicking
                     new_page_future = asyncio.Future()
@@ -591,7 +608,24 @@ class RecursiveScraper:
                         )
 
                         # Click the element
-                        await handle.evaluate("(el) => el.click()")
+                        logging.info(
+                            f"[helper {helper_id}] Clicking element: {xpath} in {url} "
+                        )
+                        try:
+                            await element.click()
+                        except Exception:
+                            # fallback to JS click on element handle
+                            handle = await element.element_handle()
+                            if handle:
+                                try:
+                                    await handle.evaluate("(el) => el.click()")
+                                except Exception as e:
+                                    logging.error(
+                                        f"[helper {helper_id}] JS click failed for {xpath} in {url}: {e}"
+                                    )
+                                    visible_elements.append(element_data)
+                                    continue
+
                         parent_xpath = xpath
                         clciked_xpaths.append(xpath)
 
@@ -608,7 +642,7 @@ class RecursiveScraper:
                                 f"[helper {helper_id}] Detected new tab: {new_url}"
                             )
                             element_data["opened_new_tab"] = new_url
-                            self.navigatable_elements[key_hash] = new_url
+                            await self.state.add_navigation(key_hash, new_url)
                             if not await self.should_skip_link(
                                 previous_url, new_url, helper_id
                             ):
@@ -652,10 +686,10 @@ class RecursiveScraper:
                             # )
 
                             if page.url != previous_url:
-                                # new_url = page.url.split("?")[0].split("#")[0]
-                                new_url = page.url.split("#")[0]
+                                new_url = page.url.split("?")[0].split("#")[0]
+                                # new_url = page.url.split("#")[0]
                                 element_data["navigated_to"] = new_url
-                                self.navigatable_elements[key_hash] = new_url
+                                await self.state.add_navigation(key_hash, new_url)
                                 logging.info(
                                     f"[helper {helper_id}] Detected same-tab navigation to: {new_url}"
                                 )
@@ -676,10 +710,10 @@ class RecursiveScraper:
                                             f"[helper {helper_id}] Navigation URL already scraped: {new_url}"
                                         )
 
-                                await page.go_back()
-                                await self.wait_until_ready(
-                                    page, timeout=15, settle_time=1, helper_id=helper_id
+                                await self.safe_go_back(
+                                    page, helper_id, previous_url=previous_url
                                 )
+
                             else:
                                 popup_data = await self.detect_and_handle_popups(
                                     page, helper_id
@@ -696,110 +730,141 @@ class RecursiveScraper:
                                         helper_id=helper_id,
                                     )
                                     # continue
-                                else:
+
+                                logging.info(
+                                    f"[helper {helper_id}] No navigation occurred after click."
+                                )
+                                dom_after = await page.evaluate(
+                                    "document.documentElement.outerHTML"
+                                )
+                                dom_after_visible = await page.evaluate(
+                                    self.script_visible_element
+                                )
+
+                                dom_before_visible = await self._normalize_dom(
+                                    dom_before_visible
+                                )
+                                dom_after_visible = await self._normalize_dom(
+                                    dom_after_visible
+                                )
+
+                                if (
+                                    dom_before_visible != dom_after_visible
+                                    or dom_before != dom_after
+                                ):
+                                    if previous_element_xpath is None:
+                                        previous_element_xpath = (
+                                            clciked_xpaths[
+                                                clciked_xpaths.index(xpath) - 1
+                                            ]
+                                            if clciked_xpaths.index(xpath) > 0
+                                            else None
+                                        )
                                     logging.info(
-                                        f"[helper {helper_id}] No navigation occurred after click."
+                                        f"[helper {helper_id}] DOM changed after click on {xpath} in {url}."
                                     )
-                                    dom_after = await page.evaluate(
-                                        "document.documentElement.outerHTML"
+                                    soup_old = BeautifulSoup(dom_before, "html.parser")
+                                    soup_new = BeautifulSoup(dom_after, "html.parser")
+
+                                    old_elements = await self.extract_dom_structure(
+                                        soup_old
                                     )
-                                    dom_after_visible = await page.evaluate(
-                                        self.script_visible_element
+                                    new_elements = await self.extract_dom_structure(
+                                        soup_new
                                     )
 
-                                    dom_before_visible = await self._normalize_dom(
-                                        dom_before_visible
-                                    )
-                                    dom_after_visible = await self._normalize_dom(
-                                        dom_after_visible
+                                    changes = await self.compare_doms(
+                                        old_elements, new_elements, helper_id, True
                                     )
 
-                                    if dom_before_visible != dom_after_visible:
-                                        if previous_element_xpath is None:
-                                            previous_element_xpath = (
-                                                clciked_xpaths[
-                                                    clciked_xpaths.index(xpath) - 1
-                                                ]
-                                                if clciked_xpaths.index(xpath) > 0
-                                                else None
-                                            )
+                                    if changes["added"]:
                                         logging.info(
-                                            f"[helper {helper_id}] DOM changed after click on {xpath} in {url}."
+                                            f"helper {helper_id}:  internal routes detected in {url} "
                                         )
-                                        soup_old = BeautifulSoup(
-                                            dom_before, "html.parser"
+                                        changed_xpaths = changes["added"]
+                                        element_data["internal_routes"] = (
+                                            await self.details_from_thre_xpath(
+                                                changed_xpaths,
+                                                page,
+                                                url,
+                                                helper_id,
+                                                await self.get_visible_elements_xpaths(
+                                                    page,helper_id
+                                                ),
+                                            )
                                         )
-                                        soup_new = BeautifulSoup(
-                                            dom_after, "html.parser"
-                                        )
-
-                                        old_elements = await self.extract_dom_structure(
-                                            soup_old
-                                        )
-                                        new_elements = await self.extract_dom_structure(
-                                            soup_new
-                                        )
-
-                                        changes = await self.compare_doms(
-                                            old_elements, new_elements, helper_id, True
-                                        )
-
-                                        if changes["added"]:
+                                        if previous_element_xpath:
+                                            previous_element = page.locator(
+                                                f"xpath={previous_element_xpath}"
+                                            )
                                             logging.info(
-                                                f"helper {helper_id}:  internal routes detected in {url} "
+                                                f"[helper {helper_id}] Returning to previous element {previous_element_xpath} after DOM change."
                                             )
-                                            changed_xpaths = changes["added"]
-                                            element_data["internal_routes"] = (
-                                                await self.details_from_thre_xpath(
-                                                    changed_xpaths,
-                                                    page,
-                                                    url,
-                                                    helper_id,
-                                                    await self.get_visible_elements_xpaths(
-                                                        page
-                                                    ),
+                                            try:
+                                                await previous_element.click()
+                                            except Exception:
+                                                # fallback to JS click on element handle
+                                                previous_handle = (
+                                                    await previous_element.element_handle()
                                                 )
+                                                if handle:
+                                                    try:
+                                                        await previous_handle.evaluate(
+                                                            "(el) => el.click()"
+                                                        )
+                                                    except Exception as e:
+                                                        logging.error(
+                                                            f"[helper {helper_id}] JS click failed for {xpath} in {url}: {e}"
+                                                        )
+                                                        visible_elements.append(
+                                                            element_data
+                                                        )
+                                                        continue
+                                            await self.wait_until_ready(
+                                                page,
+                                                timeout=15,
+                                                settle_time=1,
+                                                helper_id=helper_id,
                                             )
-                                            if previous_element_xpath:
-                                                previous_element = await page.query_selector(
-                                                    f"xpath={previous_element_xpath}"
-                                                )
-                                                logging.info(
-                                                    f"[helper {helper_id}] Returning to previous element {previous_element_xpath} after DOM change."
-                                                )
-                                                await previous_element.evaluate(
-                                                    "(el) => el.click()"
-                                                )
-                                                await self.wait_until_ready(
-                                                    page,
-                                                    timeout=15,
-                                                    settle_time=1,
-                                                    helper_id=helper_id,
-                                                )
 
-                                            else:
-                                                logging.info(
-                                                    f"[helper {helper_id}] No previous element to return to after DOM change so clciking the same elements."
-                                                )
-                                                await element.evaluate(
-                                                    "(el) => el.click()"
-                                                )
-                                                await self.wait_until_ready(
-                                                    page,
-                                                    timeout=15,
-                                                    settle_time=1,
-                                                    helper_id=helper_id,
-                                                )
                                         else:
                                             logging.info(
-                                                f"[helper {helper_id}] DOM changed but no new elements detected after click on {xpath} in {url}."
+                                                f"[helper {helper_id}] No previous element to return to after DOM change so clciking the same elements."
                                             )
-                                            previous_element_xpath = None
+                                            try:
+                                                await element.click()
+                                            except Exception:
+                                                # fallback to JS click on element handle
+                                                handle = await element.element_handle()
+                                                if handle:
+                                                    try:
+                                                        await handle.evaluate(
+                                                            "(el) => el.click()"
+                                                        )
+                                                    except Exception as e:
+                                                        logging.error(
+                                                            f"[helper {helper_id}] JS click failed for {xpath} in {url}: {e}"
+                                                        )
+                                                        visible_elements.append(
+                                                            element_data
+                                                        )
+                                                        continue
+                                            await self.wait_until_ready(
+                                                page,
+                                                timeout=15,
+                                                settle_time=1,
+                                                helper_id=helper_id,
+                                            )
                                     else:
                                         logging.info(
-                                            f"[helper {helper_id}] DOM did not change after click on {xpath} in {url}."
+                                            f"[helper {helper_id}] DOM changed but no new elements detected after click on {xpath} in {url}."
                                         )
                                         previous_element_xpath = None
+                                else:
+                                    logging.info(
+                                        f"[helper {helper_id}] DOM did not change after click on {xpath} in {url}."
+                                    )
+                                    previous_element_xpath = None
 
                     finally:
                         # Remove the popup listener
@@ -815,6 +880,31 @@ class RecursiveScraper:
                 continue
 
         return visible_elements
+
+    async def safe_go_back(self, page, helper_id, previous_url=None):
+        """Safely go back in browser history or reload previous URL if needed."""
+        try:
+            await page.go_back(timeout=10000, wait_until="domcontentloaded")
+            await page.wait_for_load_state("domcontentloaded")
+            await self.wait_until_ready(
+                page, timeout=15, settle_time=1, helper_id=helper_id
+            )
+            logging.info(f"helper {helper_id} Went back successfully.")
+        except Exception:
+            logging.warning(
+                f"helper {helper_id} :go_back() failed, using fallback navigation..."
+            )
+            if previous_url:
+                await page.goto(previous_url, wait_until="domcontentloaded")
+                await self.wait_until_ready(
+                    page, timeout=15, settle_time=1, helper_id=helper_id
+                )
+            else:
+                await page.evaluate("window.history.back()")
+                await page.wait_for_load_state("domcontentloaded")
+                await self.wait_until_ready(
+                    page, timeout=15, settle_time=1, helper_id=helper_id
+                )
 
     async def _normalize_dom(self, dom: str) -> str:
         """
@@ -924,7 +1014,9 @@ class RecursiveScraper:
             old_elements = await self.extract_dom_structure(soup_old)
             new_elements = await self.extract_dom_structure(soup_new)
 
-            changes = await self.compare_doms(old_elements, new_elements, helper_id)
+            changes = await self.compare_doms(
+                old_elements, new_elements, helper_id, True
+            )
 
             if (
                 len(changes["added"]) == 0
@@ -933,7 +1025,7 @@ class RecursiveScraper:
                 logging.info(
                     f"[helper {helper_id}]: no changes detected in full dom, checking visible dom only"
                 )
-                xpaths = await self.get_visible_elements_xpaths(page)
+                xpaths = await self.get_visible_elements_xpaths(page,helper_id)
                 changes["added"] = [
                     x for x in xpaths if x not in visible_elements_xpaths
                 ]
@@ -946,7 +1038,7 @@ class RecursiveScraper:
                     page,
                     page.url,
                     helper_id,
-                    await self.get_visible_elements_xpaths(page),
+                    await self.get_visible_elements_xpaths(page,helper_id),
                     element,
                 )
                 # dropdown_data = self.details_using_xpath(xpath, hover_element)
@@ -960,110 +1052,274 @@ class RecursiveScraper:
             logging.error(f"Traceback:\n{traceback.format_exc()}")
             return None
 
-    async def get_visible_elements_xpaths(self, page):
-        """Get xpaths of all visible elements on the page."""
-        body = await page.query_selector("body")
-        if not body:
+    async def get_visible_elements_xpaths(self, page,helper_id):
+        """Get xpaths of all visible elements on the page using Playwright locators."""
+        try:
+            # Use locator instead of query_selector
+            body = page.locator("body")
+
+            # Check if body exists
+            if not await body.count():
+                return []
+
+            # Create a locator for all elements under <body>
+            all_elements = body.locator("*")
+            total = await all_elements.count()
+            logging.info(f" helper {helper_id} : found {total} in the {page.url}")
+            xpaths = []
+
+            # Iterate through each element
+            for i in range(total):
+                element = all_elements.nth(i)
+                try:
+                    if await element.is_visible():
+                        xpath = await element.evaluate(self.get_xpath_js)
+                        xpaths.append(xpath)
+                except Exception as e:
+                    logging.warning(f" helper {helper_id} : Error processing element {i}: {e}")
+                    continue
+
+            return xpaths
+
+        except Exception as e:
+            logging.error(f" helper {helper_id} Error in get_visible_elements_xpaths: {e}")
+            logging.error(traceback.format_exc())
             return []
 
-        all_elements = await body.query_selector_all("*")
-        xpaths = []
-        for element in all_elements:
-            if await element.is_visible():
-                xpath = await element.evaluate(self.get_xpath_js)
-                xpaths.append(xpath)
-        return xpaths
-
-    async def safe_hover(self, page, element, xpath, helper_id):
-        """Safely hover over an element using Playwright with multiple fallback strategies."""
+    async def safe_hover(
+        self,
+        page,
+        element:Locator,  
+        helper_id,
+        *,
+        timeout: int = 3000,  # ms for individual waits
+        overall_timeout: int = 8000,  # ms total budget for hover attempts
+    ):
+        """
+        Robust hover with multiple fallbacks:
+        1. ensure visible & scroll into view
+        2. normal hover()
+        3. move mouse to element center (page.mouse.move) then mouseover
+        4. force hover
+        5. temporarily disable overlay intercepting element (pointer-events:none) and retry
+        6. dispatch PointerEvent / MouseEvent via JS (with coordinates)
+        Returns True on success, False otherwise.
+        """
+        start = time.time()
+        xpath_for_log = "[xpath_unavailable]" # Fallback log
         try:
-            # ✅ Step 1: Ensure the element is visible and stable
-            await element.scroll_into_view_if_needed(timeout=3000)
-            await page.wait_for_selector(
-                f"xpath={xpath}", state="visible", timeout=3000
+            xpath_for_log = await element.evaluate(self.get_xpath_js)
+        except Exception:
+            pass # Element might be gone, logging will use fallback
+
+            # 1) Ensure visible & scrolled into view
+        try:
+            await element.scroll_into_view_if_needed(timeout=timeout)
+        except Exception as e:
+            logging.debug(
+                f"[helper {helper_id}] scroll_into_view_if_needed failed: {e}"
             )
-            await page.wait_for_timeout(300)
 
-            # ✅ Step 2: Attempt normal hover
-            try:
-                await element.hover(timeout=3000)
-                logging.info(
-                    f"[helper {helper_id}] Hovered over element normally: {xpath}"
-                )
-                await page.wait_for_timeout(300)
-                return True
-            except Exception as e:
-                logging.warning(
-                    f"[helper {helper_id}] Normal hover failed for {xpath}: {e}"
-                )
 
-            # ✅ Step 3: Check for overlay elements that might intercept pointer events
-            try:
-                intercepting_el = await page.evaluate(
-                    """
-                    (el) => {
-                        const rect = el.getBoundingClientRect();
-                        const x = rect.left + rect.width / 2;
-                        const y = rect.top + rect.height / 2;
-                        const elAtPoint = document.elementFromPoint(x, y);
-                        if (elAtPoint && elAtPoint !== el && !el.contains(elAtPoint)) {
-                            return elAtPoint.outerHTML.slice(0, 200);
-                        }
-                        return null;
-                    }
-                    """,
-                    element,
-                )
-                if intercepting_el:
-                    logging.warning(
-                        f"[helper {helper_id}] Element {xpath} is intercepted by: {intercepting_el}"
-                    )
-                    await page.wait_for_timeout(500)
-            except Exception as overlay_e:
-                logging.debug(f"[helper {helper_id}] Overlay check failed: {overlay_e}")
+        # Helper to abort if overall timeout passed
+        def timed_out():
+            return (time.time() - start) * 1000 > overall_timeout
 
-            # ✅ Step 4: Force hover if safe
-            try:
-                await element.hover(force=True, timeout=2000)
-                logging.info(f"[helper {helper_id}] Forced hover succeeded for {xpath}")
-                await page.wait_for_timeout(300)
-                return True
-            except Exception as e:
-                logging.warning(
-                    f"[helper {helper_id}] Forced hover failed for {xpath}: {e}"
-                )
+        # 2) Try normal hover via Playwright API
+        try:
+            await element.hover(timeout=timeout)
+            logging.info(f"[helper {helper_id}] Hovered normally: {xpath_for_log}")
+            await page.wait_for_timeout(150)
+            return True
+        except Exception as e:
+            logging.warning(
+                f"[helper {helper_id}] Normal hover failed for {xpath_for_log}: {e}"
+            )
 
-            # ✅ Step 5: Final fallback - simulate hover with JS dispatch
-            try:
-                await page.evaluate(
-                    """
-                    (el) => {
-                        ['mouseover', 'mouseenter'].forEach(eventType => {
-                            const event = new MouseEvent(eventType, {
-                                bubbles: true,
-                                cancelable: true,
-                                view: window
-                            });
-                            el.dispatchEvent(event);
-                        });
-                    }
-                    """,
-                    element,
-                )
-                await page.wait_for_timeout(300)
-                logging.info(
-                    f"[helper {helper_id}] JS-dispatched hover succeeded: {xpath}"
-                )
-                return True
-            except Exception as js_e:
-                logging.error(f"[helper {helper_id}] JS hover fallback failed: {js_e}")
-                return False
-
-        except Exception as outer_e:
-            logging.error(
-                f"[helper {helper_id}] Unexpected error in safe_hover: {outer_e}"
+        if timed_out():
+            logging.warning(
+                f"[helper {helper_id}] safe_hover: overall timeout after normal hover for {xpath_for_log}"
             )
             return False
+
+        # 3) Try moving mouse to center using bounding box + page.mouse.move + mouseover
+        try:
+            box = await page.bounding_box()
+            if box:
+                cx = box["x"] + box["width"] / 2
+                cy = box["y"] + box["height"] / 2
+                # Move there (Playwright mouse uses page coordinates)
+                await page.mouse.move(cx, cy, steps=8)
+                # Fire pointer/mouse events at that coordinate
+                await page.mouse.down()
+                await page.mouse.up()
+                # small pause to let site react
+                await page.wait_for_timeout(120)
+                logging.info(
+                    f"[helper {helper_id}] Moved mouse to center for {xpath_for_log} at ({cx:.1f},{cy:.1f})"
+                )
+                # After moving, try hover() again (sometimes now it works)
+                try:
+                    await element.hover(timeout=1000)
+                    logging.info(
+                        f"[helper {helper_id}] Hover succeeded after mouse.move: {xpath_for_log}"
+                    )
+                    await page.wait_for_timeout(120)
+                    return True
+                except Exception:
+                    logging.debug(
+                        f"[helper {helper_id}] hover still failed after mouse.move for {xpath_for_log}"
+                    )
+            else:
+                logging.debug(
+                    f"[helper {helper_id}] bounding_box is None for {xpath_for_log}"
+                )
+        except Exception as e:
+            logging.debug(
+                f"[helper {helper_id}] mouse.move approach failed for {xpath_for_log}: {e}"
+            )
+
+        if timed_out():
+            logging.warning(
+                f"[helper {helper_id}] safe_hover: overall timeout after mouse.move for {xpath_for_log}"
+            )
+            return False
+
+        # 4) Try force hover (shorter timeout)
+        try:
+            await element.hover(force=True, timeout=1000)
+            logging.info(f"[helper {helper_id}] Forced hover succeeded for {xpath_for_log}")
+            await page.wait_for_timeout(120)
+            return True
+        except Exception as e:
+            logging.warning(
+                f"[helper {helper_id}] Forced hover failed for {xpath_for_log}: {e}"
+            )
+
+        if timed_out():
+            logging.warning(
+                f"[helper {helper_id}] safe_hover: overall timeout after force hover for {xpath_for_log}"
+            )
+            return False
+
+        # 5) Check for intercepting element at center and temporarily disable it (pointer-events: none)
+        try:
+            intercept_info = await element.evaluate(
+                """
+                (el) => {
+                    try {
+                        const rect = el.getBoundingClientRect();
+                        const x = rect.left + rect.width/2;
+                        const y = rect.top + rect.height/2;
+                        const topEl = document.elementFromPoint(x, y);
+                        if (!topEl) return null;
+                        if (topEl === el || el.contains(topEl)) return null;
+                        // collect a short descriptor so we can log it
+                        const desc = { tag: topEl.tagName, cls: topEl.className ? topEl.className.toString().slice(0,200) : '', id: topEl.id || '' };
+                        // store original pointer-events so we can revert
+                        const original = topEl.style.pointerEvents || '';
+                        topEl.style.pointerEvents = 'none';
+                        return { desc, original: original };
+                    } catch (err) { return null; }
+                }
+                """
+            )
+            if intercept_info:
+                logging.warning(
+                    f"[helper {helper_id}] Interceptor found for {xpath_for_log}: {intercept_info.get('desc')}, temporarily disabled it."
+                )
+                # retry hover after disabling overlay
+                try:
+                    await element.hover(timeout=1200)
+                    logging.info(
+                        f"[helper {helper_id}] Hover succeeded after disabling interceptor for {xpath_for_log}"
+                    )
+                    # revert pointer-events
+                    await element.evaluate(
+                        """
+                        (el) => {
+                            const rect = el.getBoundingClientRect();
+                            const x = rect.left + rect.width/2;
+                            const y = rect.top + rect.height/2;
+                            const topEl = document.elementFromPoint(x, y);
+                            if (topEl) topEl.style.pointerEvents = '';
+                        }
+                        """
+                    )
+                    await page.wait_for_timeout(120)
+                    return True
+                except Exception as e:
+                    logging.debug(
+                        f"[helper {helper_id}] hover failed after disabling interceptor: {e}"
+                    )
+                    # attempt to revert anyway
+                    try:
+                        await element.evaluate(
+                            """
+                            (el) => {
+                                const rect = el.getBoundingClientRect();
+                                const x = rect.left + rect.width/2;
+                                const y = rect.top + rect.height/2;
+                                const topEl = document.elementFromPoint(x, y);
+                                if (topEl) topEl.style.pointerEvents = '';
+                            }
+                            """
+                        )
+                    except Exception:
+                        pass
+        except Exception as overlay_e:
+            logging.debug(
+                f"[helper {helper_id}] overlay disable attempt failed: {overlay_e}"
+            )
+
+        if timed_out():
+            logging.warning(
+                f"[helper {helper_id}] safe_hover: overall timeout after overlay attempt for {xpath_for_log}"
+            )
+            return False
+
+        # 6) Final fallback: dispatch PointerEvent / MouseEvent at center with coordinates
+        try:
+            # compute coords again if possible
+            box = await element.bounding_box()
+            coords = {"x": 0, "y": 0}
+            if box:
+                coords["x"] = box["x"] + box["width"] / 2
+                coords["y"] = box["y"] + box["height"] / 2
+
+            await element.evaluate(
+                """
+                (el, cx, cy) => {
+                    function dispatch(type, x, y) {
+                        let ev;
+                        try {
+                            ev = new PointerEvent(type, { bubbles: true, cancelable: true, pointerType: 'mouse', clientX: x, clientY: y });
+                        } catch(e) {
+                            ev = new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y });
+                        }
+                        el.dispatchEvent(ev);
+                    }
+                    dispatch('pointerover', cx, cy);
+                    dispatch('pointerenter', cx, cy);
+                    dispatch('mouseover', cx, cy);
+                    dispatch('mouseenter', cx, cy);
+                }
+                """,
+                coords["x"],
+                coords["y"],
+            )
+            await page.wait_for_timeout(150)
+            logging.info(
+                f"[helper {helper_id}] Dispatched pointer/mouse events for {xpath_for_log}"
+            )
+            return True
+        except Exception as js_e:
+            logging.error(
+                f"[helper {helper_id}] JS dispatch hover failed for {xpath_for_log}: {js_e}"
+            )
+            logging.debug(traceback.format_exc())
+            return False
+
 
     async def get_xpath_bs(self, el):
         parts = []
@@ -1212,9 +1468,9 @@ class RecursiveScraper:
         try:
             # --- 1. Modal dialogs ---
             modal_selectors = [
-                # --- Headless UI / similar (explicit) ---
-                "//div[contains(@id,'headlessui-dialog') or contains(@id,'headlessui-dialog-panel')]",
-                "//*[@data-headlessui-state='open' or contains(@data-headlessui-state,'open')]",
+                # # --- Headless UI / similar (explicit) ---
+                # "//div[contains(@id,'headlessui-dialog') or contains(@id,'headlessui-dialog-panel')]",
+                # "//*[@data-headlessui-state='open' or contains(@data-headlessui-state,'open')]",
                 # --- Radix / data-state pattern (open) ---
                 "//*[@data-state='open' and (contains(@id,'dialog') or contains(@class,'dialog') or @role='dialog')]",
                 # --- explicit ARIA / roles (best practice) ---
@@ -1228,15 +1484,11 @@ class RecursiveScraper:
                 "//div[contains(@class,'modal') or contains(@class,'dialog') or contains(@class,'popup') or contains(@class,'lightbox')]",
                 # --- popular frameworks (Ant / Material / Chakra / Mantine / Bootstrap / Shadcn) ---
                 "//div[contains(@class,'ant-modal') or contains(@class,'ant-drawer')]",
-                "//div[contains(@class,'MuiDialog') or contains(@class,'MuiModal')]",
+                # "//div[contains(@class,'MuiDialog') or contains(@class,'MuiModal')]",
                 "//div[contains(@class,'chakra-modal') or contains(@class,'chakra-alert-dialog')]",
                 "//div[contains(@class,'mantine-Modal') or contains(@class,'mantine-Drawer')]",
                 "//div[contains(@class,'bootbox') or (contains(@class,'fade') and contains(@class,'show'))]",
                 "//div[contains(@class,'shadcn') or contains(@class,'radix') or contains(@class,'headlessui')]",
-                # --- overlays / backdrops (visible modal overlays) ---
-                "//div[contains(@style,'position: fixed') and (contains(@class,'overlay') or contains(@class,'backdrop') or contains(@class,'modal'))]",
-                "//*[contains(@class,'backdrop') or contains(@class,'overlay')][contains(@style,'opacity') or contains(@style,'background')]",
-                "//*[contains(@data-backdrop,'true') or contains(@data-overlay,'true')]",
                 # --- visible / shown heuristics: elements with inline display:block / non-zero size & transform hints ---
                 "//div[(contains(@style,'display:block') or contains(@style,'display: block') or contains(@style,'visibility: visible')) and (contains(@class,'modal') or contains(@id,'dialog') or @role='dialog')]",
                 "//div[(number(string-length(normalize-space(@innerHTML))) > 0) and (contains(@style,'position: fixed') or contains(@style,'position: absolute'))]",
@@ -1251,7 +1503,24 @@ class RecursiveScraper:
 
             for selector in modal_selectors:
                 elements = await page.locator(f"xpath={selector}").element_handles()
-                visible_modals = [el for el in elements if await el.is_visible()]
+                visible_modals = []
+                for el in elements:
+                    try:
+                        is_visible = await el.is_visible()
+                        if not is_visible:
+                            continue
+
+                        # Check rendered width and height
+                        size = await el.evaluate(
+                            "(node) => ({width: node.offsetWidth || 0, height: node.offsetHeight || 0})"
+                        )
+                        if size["width"] > 0 and size["height"] > 0:
+                            logging.info(
+                                f"helper {helper_id} Modal size: {size} for selector: {selector}"
+                            )
+                            visible_modals.append(el)
+                    except Exception:
+                        continue
 
                 if visible_modals:
                     modal = visible_modals[0]
@@ -1282,7 +1551,24 @@ class RecursiveScraper:
 
             for selector in tooltip_selectors:
                 elements = await page.locator(f"xpath={selector}").element_handles()
-                visible_tooltips = [el for el in elements if await el.is_visible()]
+                visible_tooltips = []
+                for el in elements:
+                    try:
+                        is_visible = await el.is_visible()
+                        if not is_visible:
+                            continue
+
+                        # Check rendered width and height
+                        size = await el.evaluate(
+                            "(node) => ({width: node.offsetWidth || 0, height: node.offsetHeight || 0})"
+                        )
+                        if size["width"] > 0 and size["height"] > 0:
+                            logging.info(
+                                f"helper {helper_id} Tooltip size: {size} for selector: {selector}"
+                            )
+                            visible_tooltips.append(el)
+                    except Exception:
+                        continue
 
                 if visible_tooltips:
                     tooltip = visible_tooltips[0]
@@ -1298,6 +1584,10 @@ class RecursiveScraper:
             # --- 3. Overlays ---
             overlay_selectors = [
                 # --- Framework-specific masks / backdrops (specific first) ---
+                # --- overlays / backdrops (visible modal overlays) ---
+                "//div[contains(@style,'position: fixed') and (contains(@class,'overlay') or contains(@class,'backdrop') or contains(@class,'modal'))]",
+                "//*[contains(@class,'backdrop') or contains(@class,'overlay')][contains(@style,'opacity') or contains(@style,'background')]",
+                "//*[contains(@data-backdrop,'true') or contains(@data-overlay,'true')]",
                 "//div[contains(@class,'ant-modal-mask') or contains(@class,'ant-drawer-mask')]",
                 "//div[contains(@class,'MuiBackdrop-root') or contains(@class,'MuiModal-backdrop')]",
                 "//div[contains(@class,'chakra-modal__overlay') or contains(@class,'chakra-popover__popper')]",
@@ -1309,11 +1599,11 @@ class RecursiveScraper:
                 # --- data-state / data-open patterns (Radix / HeadlessUI / custom) ---
                 "//*[(@data-state='open' or @data-open='true' or @data-open='') and (contains(@class,'overlay') or contains(@id,'overlay') or contains(@class,'backdrop') or contains(@role,'presentation'))]",
                 # --- style-based visibility + position + z-index heuristics (common) ---
-                "//div[(contains(@style,'position: fixed') or contains(@style,'position: absolute')) and (contains(@style,'z-index') or contains(@style,'opacity') or contains(@style,'background'))]",
-                "//div[contains(@style,'position: fixed') and (contains(@style,'rgba') or contains(@style,'opacity') or contains(@style,'background')) and not(contains(@style,'opacity: 0'))]",
+                # "//div[(contains(@style,'position: fixed') or contains(@style,'position: absolute')) and (contains(@style,'z-index') or contains(@style,'opacity') or contains(@style,'background'))]",
+                # "//div[contains(@style,'position: fixed') and (contains(@style,'rgba') or contains(@style,'opacity') or contains(@style,'background')) and not(contains(@style,'opacity: 0'))]",
                 # --- elements that are full-screen / near-full-screen by bounding heuristics (fallback) ---
                 # Note: these use visible heuristics in runtime code (not pure XPath) but left here for discovery
-                "//div[(contains(@style,'top: 0') or contains(@style,'left: 0')) and (contains(@style,'width: 100%') or contains(@style,'height: 100%') or contains(@style,'inset: 0'))]",
+                # "//div[(contains(@style,'top: 0') or contains(@style,'left: 0')) and (contains(@style,'width: 100%') or contains(@style,'height: 100%') or contains(@style,'inset: 0'))]",
                 # --- semantic / ARIA fallbacks (rare for overlays but useful) ---
                 "//*[@role='presentation' and (contains(@class,'overlay') or contains(@id,'backdrop'))]",
                 "//*[contains(@aria-hidden,'true') and (contains(@class,'backdrop') or contains(@id,'overlay'))]",
@@ -1326,10 +1616,22 @@ class RecursiveScraper:
                 elements = await page.locator(f"xpath={selector}").element_handles()
                 visible_overlays = []
                 for el in elements:
-                    if await el.is_visible():
-                        box = await el.bounding_box()
-                        if box and box["height"] > 50:
+                    try:
+                        is_visible = await el.is_visible()
+                        if not is_visible:
+                            continue
+
+                        # Check rendered width and height
+                        size = await el.evaluate(
+                            "(node) => ({width: node.offsetWidth || 0, height: node.offsetHeight || 0})"
+                        )
+                        if size["width"] > 0 and size["height"] > 0:
+                            logging.info(
+                                f"helper {helper_id} Overlay size: {size} for selector: {selector}"
+                            )
                             visible_overlays.append(el)
+                    except Exception:
+                        continue
 
                 if visible_overlays:
                     overlay = visible_overlays[0]
@@ -1418,6 +1720,19 @@ class RecursiveScraper:
                 "error": str(e),
             }
 
+    async def _is_locator_visible_safe(self, loc: Locator) -> bool:
+        try:
+            # count + is_visible reduces detached-element races
+            if await loc.count() == 0:
+                return False
+            vis = await loc.is_visible()
+            if not vis:
+                return False
+            box = await loc.bounding_box()
+            return bool(box and box["width"] > 0 and box["height"] > 0)
+        except Exception:
+            return False
+
     async def close_popup(
         self, page: Page, popup_element, popup_type: str, helper_id: int
     ):
@@ -1425,6 +1740,9 @@ class RecursiveScraper:
         Attempt to close the popup using various methods.
         """
         try:
+            popup_element = page.locator(
+                f"xpath={await popup_element.evaluate(self.get_xpath_js)}"
+            )
             close_selectors = [
                 # === 1️⃣ Text-based close buttons ===
                 ".//button[contains(normalize-space(.), '×')]",
@@ -1467,45 +1785,67 @@ class RecursiveScraper:
 
             # Try close buttons first
             for selector in close_selectors:
-                btn = await popup_element.query_selector(f"xpath={selector}")
-                if btn and await btn.is_visible():
-                    await btn.click()
+                btn = popup_element.locator(f"xpath={selector}")
+                # try repeatedly clicking the first visible matching locator until either popup closes or nothing visible
+                try:
+                    while await btn.count() and await btn.first.is_visible():
+                        await btn.first.click()
+                        await asyncio.sleep(0.5)
+                        if not await self._is_locator_visible_safe(popup_element):
+                            logging.info(
+                                f"helper {helper_id} {popup_type} closed after clicking {selector}"
+                            )
+                            return True
                     logging.info(
-                        f"helper {helper_id} Closed {popup_type} using {selector}"
+                        f"helper {helper_id} no visible candidates left for {selector}"
                     )
-                    await asyncio.sleep(0.5)
-                    return True
+                except Exception as e:
+                    logging.debug(f"helper {helper_id} selector {selector} failed: {e}")
 
             # Escape key for modals
             if popup_type in ["modal", "dropdown"]:
                 await page.keyboard.press("Escape")
                 logging.info(f"helper {helper_id} Closed {popup_type} using Escape key")
                 await asyncio.sleep(0.5)
-                return True
+                if not await self._is_locator_visible_safe(popup_element):
+                    logging.info(
+                        f"helper {helper_id} {popup_type} closed after pressing Escape key"
+                    )
+                    return True
+                else:
+                    logging.info(
+                        f"helper {helper_id} {popup_type} still visible after pressing Escape key"
+                    )
 
             # Click outside for tooltips/dropdowns
-            if popup_type in ["tooltip", "dropdown"]:
-                await page.mouse.click(10, 10)
-                logging.info(
-                    f"helper {helper_id} Closed {popup_type} by clicking outside"
-                )
-                await asyncio.sleep(0.5)
-                return True
+            if popup_type in ["overlay"]:
+                try:
+                    # Get the bounding box of the popup element
+                    box = await popup_element.bounding_box()
 
-            # Click overlay background
-            overlay = await page.query_selector(
-                "xpath=//div[contains(@class,'modal-backdrop') or contains(@class,'overlay')]"
-            )
-            if overlay and await overlay.is_visible():
-                await overlay.click()
-                logging.info(
-                    f"helper {helper_id} Closed {popup_type} by clicking overlay"
-                )
-                await asyncio.sleep(0.5)
-                return True
+                    if box:
+                        # Pick a point safely inside the overlay (e.g., center)
+                        click_x = box["x"] + box["width"] / 2
+                        click_y = box["y"] + box["height"] / 2
 
-            logging.warning(f"helper {helper_id} Could not close {popup_type}")
-            return False
+                        await page.mouse.click(click_x, click_y)
+                        logging.info(f"helper {helper_id} Closed {popup_type} by clicking overlay at ({click_x:.1f},{click_y:.1f})")
+
+                        await asyncio.sleep(0.5)
+
+                        if not await self._is_locator_visible_safe(popup_element):
+                            logging.info(f"helper {helper_id} {popup_type} closed after clicking overlay")
+                            return True
+                        else:
+                            logging.info(f"helper {helper_id} {popup_type} still visible after clicking overlay")
+                    else:
+                        logging.warning(f"helper {helper_id} Could not get bounding box for {popup_type}")
+
+                except Exception as e:
+                    logging.error(f"helper {helper_id} Error clicking overlay: {e}")
+
+                logging.warning(f"helper {helper_id} Could not close {popup_type}")
+                return False
 
         except Exception as e:
             logging.error(f"helper {helper_id} Error closing {popup_type}: {e}")
@@ -1556,6 +1896,8 @@ class RecursiveScraper:
                     pass
                 continue
 
+    # file: playwright_login.py
+
     async def login_to_website(
         self,
         url: str,
@@ -1569,48 +1911,58 @@ class RecursiveScraper:
         page: Page = None,
     ):
         """
-        Generic login function using Playwright (async)
+        Generic async login function using Playwright.
 
-        Args:
-            url: Website login URL
-            login_link_selector: CSS or XPath selector for login link/button
-            username: Your username/email
-            password: Your password
-            username_selector: CSS or XPath selector for username field
-            password_selector: CSS or XPath selector for password field
-            login_button_selector: CSS or XPath selector for login button
-            wait_for_url_change: Wait for URL to change after login (default: True)
+        Handles navigation reloads safely and returns a single Page object.
         """
         try:
-            print(f"Navigating to: {url}")
+            logging.info(f"Navigating to: {url}")
             await page.goto(url, timeout=20000)
             await page.wait_for_load_state("domcontentloaded")
 
-            await page.click(f"xpath={login_link_selector}")
-            await page.wait_for_load_state("domcontentloaded")
+            if login_link_selector:
+                logging.info(f"clicking the login button {login_button_selector}")
+                await page.click(f"xpath={login_link_selector}")
+                await page.wait_for_load_state("domcontentloaded")
 
-            # Fill username and password fields
-            await page.fill(f"xpath={username_selector}", username)
-            await page.fill(f"xpath={password_selector}", password)
+            # Ensure input fields exist before typing
+            await page.wait_for_selector(f"xpath={username_selector}", timeout=5000)
+            await page.wait_for_selector(f"xpath={password_selector}", timeout=5000)
 
-            # Click the login button
-            await page.click(f"xpath={login_button_selector}")
+            # Type slowly to mimic human behavior
+            await page.fill(f"xpath={username_selector}", "")
+            await page.type(f"xpath={username_selector}", username, delay=50)
 
-            # Optional: Wait for URL to change after login
+            await page.fill(f"xpath={password_selector}", "")
+            await page.type(f"xpath={password_selector}", password, delay=50)
+
+            # Wait before clicking login to avoid context loss
+            await page.wait_for_timeout(500)
+
+            # Wait for navigation triggered by login
+            async with page.expect_navigation(
+                wait_until="domcontentloaded", timeout=15000
+            ):
+                await page.click(f"xpath={login_button_selector}")
+
+            await self.wait_until_ready(page)
+
+            # Optionally wait for URL change
             if wait_for_url_change:
+                old_url = url
                 try:
-                    await page.wait_for_url(
-                        lambda current: current != url, timeout=10000
+                    await page.wait_for_function(
+                        f"window.location.href !== '{old_url}'", timeout=10000
                     )
                 except PlaywrightTimeoutError:
-                    print("⚠️ Login completed, but URL did not change.")
+                    logging.warning(" Login completed, but URL did not change.")
 
-            print("✅ Login successful!")
-            return page  # Keep browser open for reuse
+            logging.info("✅ Login successful!")
+            return page
 
         except Exception as e:
             print(f"❌ Login failed: {str(e)}")
-            return None, None
+            return None
 
     async def run(
         self,
@@ -1624,10 +1976,13 @@ class RecursiveScraper:
     ):
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=False,
-                args=["--disable-web-security", "--window-size=1920,1080"],
+                headless=True,
+                args=[
+                    "--start-maximized",
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
-            context = await browser.new_context()
+            context = await browser.new_context(no_viewport=True)
             if login_url:
                 logging.info(f"Logging in to {login_url}...")
                 page = await self.login_to_website(
@@ -1721,22 +2076,35 @@ class RecursiveScraper:
 
 
 if __name__ == "__main__":
-    asyncio.run(
-        RecursiveScraper(
-            "https://webopt.ai/", max_concurrency=5, avoid_page=["tools"]
-        ).run(
-            "https://webopt.ai/",
-            "/html/body/div[1]/header/nav/div[3]/div/div/p",
-            "vahak77251@bllibl.com",
-            "Test@12345",
-            "/html/body/div[4]/div/div/div/div[2]/div/div/form/div/div/div[3]/input",
-            "/html/body/div[4]/div/div/div/div[2]/div/div/form/div/div/div[3]/div[1]/input",
-            "/html/body/div[4]/div/div/div/div[2]/div/div/form/div/div/div[4]/button",
-        )
-    )
+    # asyncio.run(
+    #     RecursiveScraper(
+    #         "https://webopt.ai/seo/report?id=46ba1dd4-bd83-41af-a4d5-8f50ea037641&pageId=633e3ae9-0d48-4c95-aa7a-6e6da733a1b3", max_concurrency=1, avoid_page=["tools"]
+    #     ).run(
+    #         "https://webopt.ai/",
+    #         "/html/body/div[1]/header/nav/div[3]/div/div/p",
+    #         "vahak77251@bllibl.com",
+    #         "Test@12345",
+    #         "/html/body/div[4]/div/div/div/div[2]/div/div/form/div/div/div[3]/input",
+    #         "/html/body/div[4]/div/div/div/div[2]/div/div/form/div/div/div[3]/div[1]/input",
+    #         "/html/body/div[4]/div/div/div/div[2]/div/div/form/div/div/div[4]/button",
+    #     )
+    # )
 
     # asyncio.run(
     #     RecursiveScraper(
-    #        "http://localhost:3000/", max_concurrency=5, avoid_page=["tools", "blog"]
-    #     ).run()
+    #         "https://app.instantly.ai/app/accounts", max_concurrency=5
+    #     ).run(
+    #         login_url="https://app.instantly.ai/auth/login",
+    #         username="sabarish@episyche.com",
+    #         password="Test@123!",
+    #         username_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[1]/input",
+    #         password_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[2]/input",
+    #         login_button_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[2]/div[1]/button",
+    #     )
     # )
+
+    asyncio.run(
+        RecursiveScraper(
+           "http://localhost:3000/", max_concurrency=5, avoid_page=["tools", "blog"]
+        ).run()
+    )
