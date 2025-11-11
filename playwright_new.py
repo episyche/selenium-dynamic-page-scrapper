@@ -18,7 +18,6 @@ import re
 
 # import sqlite3
 import aiosqlite
-from bs4 import BeautifulSoup
 
 # --- logging setup (ensure directory exists) ---
 os.makedirs("logs", exist_ok=True)
@@ -33,7 +32,7 @@ logging.basicConfig(
 @dataclass
 class ThreadSafeState:
     """Thread-safe state container using asyncio locks"""
-    
+
     scraped_urls: Set[str] = field(default_factory=set)
     results_all: List[Dict] = field(default_factory=list)
     unique_element_hashes: Set[str] = field(default_factory=set)
@@ -66,7 +65,7 @@ class ThreadSafeState:
             logging.info(
                 f"helper {helper_id} Added result for URL: {result.get('url', 'unknown')} (Total results: {len(self.results_all)})"
             )
-            
+
     async def add_unique_hash(self, key_hash: str) -> bool:
         """
         Add element hash to set. Returns True if added, False if already exists.
@@ -368,13 +367,26 @@ class RecursiveScraper:
             page = await context.new_page()
             self.helper_pages[helper_id].add(page)
 
-            await page.goto(url, timeout=15000)
-            # await page.wait_for_load_state("networkidle")
-            await self.wait_until_ready(
-                page, timeout=15, settle_time=1, helper_id=helper_id
-            )
-
+            success = False
+            for attempt in range(3): # Try 3 times
+                try:
+                    await page.goto(url, timeout=20000) # Increased timeout
+                    await self.wait_until_ready(
+                        page, timeout=20, settle_time=1, helper_id=helper_id # Increased timeout
+                    )
+                    success = True
+                    break # Success!
+                except Exception as e:
+                    logging.warning(
+                        f"[helper {helper_id}] Attempt {attempt + 1}/3 failed for {url}: {e}"
+                    )
+                    if attempt == 2: # Last attempt failed
+                        raise # Re-raise the exception to be caught by outer block
+                    await asyncio.sleep(3) # Wait 3 seconds before retrying
             
+            if not success:
+                logging.error(f"[helper {helper_id}] is unable to open the link {url} by 3 Attempts")
+                return
 
             page_details = {
                 "title": await page.title(),
@@ -386,7 +398,9 @@ class RecursiveScraper:
             if popups:
                 page_details["popups"] = popups
 
-            visible_elements_xpaths = await self.get_visible_elements_xpaths(page=page,helper_id=helper_id)
+            visible_elements_xpaths = await self.get_visible_elements_xpaths(
+                page=page, helper_id=helper_id
+            )
             logging.info(
                 f"helper {helper_id}: Found {len(visible_elements_xpaths)} visible elements on {url}"
             )
@@ -439,6 +453,7 @@ class RecursiveScraper:
         visible_elements = []
         clciked_xpaths = []
         for xpath in xpaths:
+            is_dropdown_detected = False
             await self.pause_event.wait()
             try:
                 if hover_element:
@@ -494,7 +509,7 @@ class RecursiveScraper:
 
                 attrs_sorted = sorted(attrs.items())
                 # Combine all element info into a list
-                key_list = [tag, xpath, direct_text, attrs_sorted,all_text]
+                key_list = [tag, xpath, direct_text, attrs_sorted, all_text]
 
                 # Serialize to JSON string
                 key_str = json.dumps(key_list, sort_keys=True)
@@ -540,12 +555,13 @@ class RecursiveScraper:
                     and await element.is_enabled()
                     and not await self.is_child_xpath(parent_xpath, xpath)
                 ):
-                    dom_before_hover = await page.evaluate(
-                        "document.documentElement.outerHTML"
+                    map_before_hover = await self.get_visible_content_map(
+                        page, visible_elements_xpaths, helper_id
                     )
-                    dom_before_hover_visible = await page.evaluate(
-                        self.script_visible_element
-                    )
+                    hash_before_hover = await self.get_hash_from_map(map_before_hover)
+                    
+                    visible_elements_before_hover=await self.get_visible_elements_xpaths(page=page,helper_id=helper_id)
+
                     processed_text = (
                         await element.evaluate("(el) => el.innerText || ''")
                     )[:30].lower()
@@ -568,14 +584,17 @@ class RecursiveScraper:
                         # detect dropdowns after hover
                         dropdown_xpaths = await self.detect_dropdown_after_hover(
                             page,
-                            dom_before_hover,
-                            dom_before_hover_visible,
+                            map_before_hover,
+                            hash_before_hover,
                             helper_id,
-                            visible_elements_xpaths,
+                            visible_elements_before_hover,
                             element,
                         )
                         if dropdown_xpaths:
                             element_data["dropdowns_after_hover"] = dropdown_xpaths
+                            is_dropdown_detected = True
+                            await asyncio.sleep(1.0)
+                            await self.wait_until_ready(page, helper_id=helper_id)
 
                     href = attrs.get("href")
                     if tag.lower() == "a" and await self.should_skip_link(
@@ -599,13 +618,12 @@ class RecursiveScraper:
                         # Optional: Use click lock for extra safety
                         # async with self.click_lock:
 
+                        map_before = await self.get_visible_content_map(
+                            page, visible_elements_xpaths, helper_id
+                        )
+                        hash_before = await self.get_hash_from_map(map_before)
+
                         # getting the dom details before clicking
-                        dom_before = await page.evaluate(
-                            "document.documentElement.outerHTML"
-                        )
-                        dom_before_visible = await page.evaluate(
-                            self.script_visible_element
-                        )
 
                         # Click the element
                         logging.info(
@@ -734,24 +752,26 @@ class RecursiveScraper:
                                 logging.info(
                                     f"[helper {helper_id}] No navigation occurred after click."
                                 )
-                                dom_after = await page.evaluate(
-                                    "document.documentElement.outerHTML"
-                                )
-                                dom_after_visible = await page.evaluate(
-                                    self.script_visible_element
-                                )
 
-                                dom_before_visible = await self._normalize_dom(
-                                    dom_before_visible
+                                await self.wait_until_ready(
+                                    page,
+                                    timeout=5,
+                                    settle_time=0.5,
+                                    helper_id=helper_id,
                                 )
-                                dom_after_visible = await self._normalize_dom(
-                                    dom_after_visible
+                                visible_xpaths_after = (
+                                    await self.get_visible_elements_xpaths(
+                                        page, helper_id
+                                    )
                                 )
+                                map_after = await self.get_visible_content_map(
+                                    page, visible_xpaths_after, helper_id
+                                )
+                                hash_after = await self.get_hash_from_map(map_after)
 
                                 if (
-                                    dom_before_visible != dom_after_visible
-                                    or dom_before != dom_after
-                                ):
+                                    hash_before != hash_after
+                                ) and not is_dropdown_detected:
                                     if previous_element_xpath is None:
                                         previous_element_xpath = (
                                             clciked_xpaths[
@@ -763,34 +783,23 @@ class RecursiveScraper:
                                     logging.info(
                                         f"[helper {helper_id}] DOM changed after click on {xpath} in {url}."
                                     )
-                                    soup_old = BeautifulSoup(dom_before, "html.parser")
-                                    soup_new = BeautifulSoup(dom_after, "html.parser")
+                                    new_xpaths = [
+                                        x
+                                        for x in visible_xpaths_after
+                                        if x not in visible_elements_xpaths
+                                    ]
 
-                                    old_elements = await self.extract_dom_structure(
-                                        soup_old
-                                    )
-                                    new_elements = await self.extract_dom_structure(
-                                        soup_new
-                                    )
-
-                                    changes = await self.compare_doms(
-                                        old_elements, new_elements, helper_id, True
-                                    )
-
-                                    if changes["added"]:
+                                    if new_xpaths:
                                         logging.info(
-                                            f"helper {helper_id}:  internal routes detected in {url} "
+                                            f"[helper {helper_id}] Found {len(new_xpaths)} new elements (internal routes)."
                                         )
-                                        changed_xpaths = changes["added"]
                                         element_data["internal_routes"] = (
                                             await self.details_from_thre_xpath(
-                                                changed_xpaths,
+                                                new_xpaths,  # Process only the new elements
                                                 page,
                                                 url,
                                                 helper_id,
-                                                await self.get_visible_elements_xpaths(
-                                                    page,helper_id
-                                                ),
+                                                visible_xpaths_after,  # Pass the new full list
                                             )
                                         )
                                         if previous_element_xpath:
@@ -856,10 +865,92 @@ class RecursiveScraper:
                                                 helper_id=helper_id,
                                             )
                                     else:
+                                        # No new XPaths, so the change must be in-place.
                                         logging.info(
-                                            f"[helper {helper_id}] DOM changed but no new elements detected after click on {xpath} in {url}."
+                                            f"[helper {helper_id}] DOM changed: Content was modified in-place."
                                         )
-                                        previous_element_xpath = None
+                                        modified_xpath = (
+                                            self._get_modified_elements_data(
+                                                map_before, map_after
+                                            )
+                                        )
+                                        element_data["internal_routes"] = (
+                                            await self.details_from_thre_xpath(
+                                                modified_xpath,  # Process only the new elements
+                                                page,
+                                                url,
+                                                helper_id,
+                                                visible_xpaths_after,  # Pass the new full list
+                                            )
+                                        )
+
+                                        if previous_element_xpath:
+                                            previous_element = page.locator(
+                                                f"xpath={previous_element_xpath}"
+                                            )
+                                            logging.info(
+                                                f"[helper {helper_id}] Returning to previous element {previous_element_xpath} after DOM change."
+                                            )
+                                            try:
+                                                await previous_element.click()
+                                            except Exception:
+                                                # fallback to JS click on element handle
+                                                previous_handle = (
+                                                    await previous_element.element_handle()
+                                                )
+                                                if handle:
+                                                    try:
+                                                        await previous_handle.evaluate(
+                                                            "(el) => el.click()"
+                                                        )
+                                                    except Exception as e:
+                                                        logging.error(
+                                                            f"[helper {helper_id}] JS click failed for {xpath} in {url}: {e}"
+                                                        )
+                                                        visible_elements.append(
+                                                            element_data
+                                                        )
+                                                        continue
+                                            await self.wait_until_ready(
+                                                page,
+                                                timeout=15,
+                                                settle_time=1,
+                                                helper_id=helper_id,
+                                            )
+
+                                        else:
+                                            logging.info(
+                                                f"[helper {helper_id}] No previous element to return to after DOM change so clciking the same elements."
+                                            )
+                                            try:
+                                                await element.click()
+                                            except Exception:
+                                                # fallback to JS click on element handle
+                                                handle = await element.element_handle()
+                                                if handle:
+                                                    try:
+                                                        await handle.evaluate(
+                                                            "(el) => el.click()"
+                                                        )
+                                                    except Exception as e:
+                                                        logging.error(
+                                                            f"[helper {helper_id}] JS click failed for {xpath} in {url}: {e}"
+                                                        )
+                                                        visible_elements.append(
+                                                            element_data
+                                                        )
+                                                        continue
+                                            await self.wait_until_ready(
+                                                page,
+                                                timeout=15,
+                                                settle_time=1,
+                                                helper_id=helper_id,
+                                            )
+                                    # else:
+                                    #     logging.info(
+                                    #         f"[helper {helper_id}] DOM changed but no new elements detected after click on {xpath} in {url}."
+                                    #     )
+                                    #     previous_element_xpath = None
                                 else:
                                     logging.info(
                                         f"[helper {helper_id}] DOM did not change after click on {xpath} in {url}."
@@ -906,143 +997,61 @@ class RecursiveScraper:
                     page, timeout=15, settle_time=1, helper_id=helper_id
                 )
 
-    async def _normalize_dom(self, dom: str) -> str:
-        """
-        Normalize DOM by removing or standardizing dynamic content.
-        Useful for comparing DOM snapshots across navigations or reloads.
-
-        Args:
-            dom: Raw DOM string
-
-        Returns:
-            Normalized DOM string
-        """
-
-        # --- 1. Normalize timestamps, dates, and times ---
-        dom = re.sub(
-            r"\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?",
-            "TIMESTAMP",
-            dom,
-        )
-        dom = re.sub(r"\b\d{1,2}:\d{2}(:\d{2})?(\s*[AP]M)?\b", "TIME", dom)
-        dom = re.sub(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", "DATE", dom)
-
-        # --- 2. Remove or standardize dynamic attributes ---
-        dom = re.sub(r'\s+id="[^"]*\d{8,}[^"]*"', ' id="DYNAMIC_ID"', dom)
-        dom = re.sub(r'\s+data-(id|reactid)="[^"]*"', ' data-\\1="DYNAMIC_ID"', dom)
-        dom = re.sub(r'\s+nonce="[^"]*"', ' nonce="REMOVED"', dom)
-        dom = re.sub(r'\s+style="[^"]*"', ' style="REMOVED"', dom)
-
-        # Remove inline event handlers like onclick="..."
-        dom = re.sub(r'\son\w+="[^"]*"', ' onEVENT="REMOVED"', dom)
-
-        # Normalize any numeric data-* attributes (e.g. data-number, data-count)
-        dom = re.sub(r'data-[a-zA-Z_-]+="\d+"', 'data-ATTR="DYNAMIC_VALUE"', dom)
-
-        # --- 3. Remove security or session identifiers ---
-        dom = re.sub(
-            r'csrf[-_]token["\s:=]+[^"\s<>]+', 'csrf_token="REMOVED"', dom, flags=re.I
-        )
-        dom = re.sub(
-            r'session[-_]id["\s:=]+[^"\s<>]+', 'session_id="REMOVED"', dom, flags=re.I
-        )
-
-        # --- 4. Replace UUIDs / hashes ---
-        dom = re.sub(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-            "UUID",
-            dom,
-            flags=re.I,
-        )
-        dom = re.sub(
-            r'id="[A-Za-z0-9_\-]{12,}"', 'id="DYNAMIC_ID"', dom
-        )  # long alphanumeric IDs
-
-        # --- 5. Remove script and comment blocks ---
-        dom = re.sub(
-            r"<script[^>]*>.*?</script>",
-            "<script>REMOVED</script>",
-            dom,
-            flags=re.DOTALL,
-        )
-        dom = re.sub(r"<!--.*?-->", "", dom, flags=re.DOTALL)
-
-        # --- 6. Replace visible numeric content ---
-        # Handles numbers with separators (’, ', comma, dot, underscore, or space)
-        dom = re.sub(
-            r">(.*?\d[\d’'`,._\s]*\d.*?)<",
-            lambda m: ">"
-            + re.sub(
-                r"\d+", "NUMBER", re.sub(r"(NUMBER[’'`,._\s]*)+", "NUMBER", m.group(1))
-            )
-            + "<",
-            dom,
-        )
-
-        # Optional: simplify patterns like "NUMBER’NUMBER’NUMBER" → "NUMBER"
-        dom = re.sub(r"(NUMBER[’'`,._\s]*)+", "NUMBER", dom)
-
-        # --- 7. Normalize whitespace ---
-        dom = re.sub(r"\s+", " ", dom).strip()
-
-        return dom
-
     async def detect_dropdown_after_hover(
         self,
         page,
-        previous_dom,
-        previous_dom_visible,
+        map_before_hover,
+        hash_before_hover,
         helper_id,
         visible_elements_xpaths,
         element,
     ):
         """Detect dropdowns that appear after hovering"""
         try:
-
-            # Get current DOM after hover
             await self.wait_until_ready(
                 page=page, timeout=5, settle_time=1, helper_id=helper_id
             )
-            current_dom = await page.evaluate("document.documentElement.outerHTML")
-            current_dom_visible = await page.evaluate(self.script_visible_element)
-            previous_dom = await self._normalize_dom(previous_dom)
-            current_dom = await self._normalize_dom(current_dom)
-
-            soup_old = BeautifulSoup(previous_dom, "html.parser")
-            soup_new = BeautifulSoup(current_dom, "html.parser")
-
-            old_elements = await self.extract_dom_structure(soup_old)
-            new_elements = await self.extract_dom_structure(soup_new)
-
-            changes = await self.compare_doms(
-                old_elements, new_elements, helper_id, True
+            visible_xpaths_after_hover = await self.get_visible_elements_xpaths(
+                page, helper_id
             )
+            map_after_hover = await self.get_visible_content_map(
+                page, visible_xpaths_after_hover, helper_id
+            )
+            hash_after_hover = await self.get_hash_from_map(map_after_hover)
 
-            if (
-                len(changes["added"]) == 0
-                and previous_dom_visible != current_dom_visible
-            ):
+            if hash_before_hover != hash_after_hover:
                 logging.info(
-                    f"[helper {helper_id}]: no changes detected in full dom, checking visible dom only"
+                    f"[helper {helper_id}] dropdown detected after hover {await element.evaluate(self.get_xpath_js)} in {page.url}."
                 )
-                xpaths = await self.get_visible_elements_xpaths(page,helper_id)
-                changes["added"] = [
-                    x for x in xpaths if x not in visible_elements_xpaths
+                new_xpaths = [
+                    x
+                    for x in visible_xpaths_after_hover
+                    if x not in visible_elements_xpaths
                 ]
-            logging.info(f"helper {helper_id} changed xpath{changes['added']}")
-            if changes["added"]:
-                logging.info(f"[helper {helper_id}]:dropdown detected ")
-                xpath = changes["added"]
-                dropdown_data = await self.details_from_thre_xpath(
-                    xpath,
-                    page,
-                    page.url,
-                    helper_id,
-                    await self.get_visible_elements_xpaths(page,helper_id),
-                    element,
-                )
-                # dropdown_data = self.details_using_xpath(xpath, hover_element)
-                return dropdown_data
+                if new_xpaths:
+                    logging.info(f"helper {helper_id} changed xpath{new_xpaths}")
+                    dropdown_data = await self.details_from_thre_xpath(
+                        new_xpaths,
+                        page,
+                        page.url,
+                        helper_id,
+                        visible_xpaths_after_hover,
+                        element,
+                    )
+                    return dropdown_data
+                else:
+                    modified_xpath = self._get_modified_elements_data(
+                        map_before_hover, map_after_hover
+                    )
+                    dropdown_data = await self.details_from_thre_xpath(
+                        modified_xpath,
+                        page,
+                        page.url,
+                        helper_id,
+                        visible_xpaths_after_hover,
+                        element,
+                    )
+                    return dropdown_data
             logging.info(f"[helper {helper_id}]:no dropdown detected")
             return None
         except Exception as e:
@@ -1052,9 +1061,10 @@ class RecursiveScraper:
             logging.error(f"Traceback:\n{traceback.format_exc()}")
             return None
 
-    async def get_visible_elements_xpaths(self, page,helper_id):
+    async def get_visible_elements_xpaths(self, page, helper_id):
         """Get xpaths of all visible elements on the page using Playwright locators."""
         try:
+            await self.wait_until_ready(page=page,timeout=5,settle_time=1)
             # Use locator instead of query_selector
             body = page.locator("body")
 
@@ -1062,34 +1072,139 @@ class RecursiveScraper:
             if not await body.count():
                 return []
 
+            skip_tags = {
+                "script",
+                "style",
+                "meta",
+                "noscript",
+            }
             # Create a locator for all elements under <body>
             all_elements = body.locator("*")
             total = await all_elements.count()
-            logging.info(f" helper {helper_id} : found {total} in the {page.url}")
+            logging.info(
+                f" helper {helper_id} : found {total} element in the {page.url}"
+            )
             xpaths = []
 
             # Iterate through each element
             for i in range(total):
                 element = all_elements.nth(i)
                 try:
+                    tag_name = await element.evaluate(
+                        "(el) => el.tagName.toLowerCase()"
+                    )
+                    if tag_name in skip_tags:
+                        continue  # skip unwanted tags
                     if await element.is_visible():
                         xpath = await element.evaluate(self.get_xpath_js)
                         xpaths.append(xpath)
                 except Exception as e:
-                    logging.warning(f" helper {helper_id} : Error processing element {i}: {e}")
+                    logging.warning(
+                        f" helper {helper_id} : Error processing element {i}: {e}"
+                    )
                     continue
 
             return xpaths
 
         except Exception as e:
-            logging.error(f" helper {helper_id} Error in get_visible_elements_xpaths: {e}")
+            logging.error(
+                f" helper {helper_id} Error in get_visible_elements_xpaths: {e}"
+            )
             logging.error(traceback.format_exc())
             return []
+
+    async def get_visible_content_map(
+        self, page: Page, xpaths: List[str], helper_id: int
+    ) -> Dict[str, str]:
+        """
+        Gets a map of {xpath: direct_text} for all given xpaths.
+        This is the raw data used for hashing and comparison.
+        """
+        try:
+            # This JS function takes the list of xpaths, finds each element,
+            # and returns an object of {xpath: direct_text}.
+            content_map = await page.evaluate(
+                """
+                (xpaths) => {
+                    
+                    // --- HELPER FUNCTION TO GET DIRECT TEXT ---
+                    function getDirectText(element) {
+                        if (!element) return "";
+                        return Array.from(element.childNodes)
+                            .filter(n => n.nodeType === Node.TEXT_NODE) // Get only text nodes
+                            .map(n => n.textContent.trim())           // Get their text and trim whitespace
+                            .filter(t => t.length > 0)                // Filter out empty strings
+                            .join(' ');                               // Join them with a space
+                    }
+                    // --- END HELPER FUNCTION ---
+
+                    const signatures = {};
+                    for (const xpath of xpaths) {
+                        try {
+                            const el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                            if (el) {
+                                // --- THIS IS THE MODIFIED PART ---
+                                // Use the helper function instead of el.innerText
+                                const text = getDirectText(el);
+                                signatures[xpath] = text;
+                            } else {
+                                signatures[xpath] = null; // Mark as not found (e.g., detached)
+                            }
+                        } catch (e) {
+                            signatures[xpath] = null; // Mark as error
+                        }
+                    }
+                    return signatures;
+                }
+                """,
+                xpaths,
+            )
+            return content_map
+        except Exception as e:
+            logging.warning(f"helper {helper_id} Could not generate content map: {e}")
+            return {"error": str(e)}
+
+    async def get_hash_from_map(self, content_map: Dict[str, str]) -> str:
+        """Generates a stable hash from a content map."""
+        try:
+            # Use json.dumps with sort_keys=True for a canonical representation
+            canonical_string = json.dumps(content_map, sort_keys=True)
+            return hashlib.sha256(canonical_string.encode()).hexdigest()
+        except Exception as e:
+            logging.error(f"Could not hash content map: {e}")
+            # Return a unique hash to force a "change" state on error
+            return hashlib.sha256(f"error_{time.time()}".encode()).hexdigest()
+
+    def _get_modified_elements_data(
+        self, map_before: Dict[str, str], map_after: Dict[str, str]
+    ) -> List[Dict[str, str]]:
+        """
+        Compares two content maps and returns a list of dictionaries
+        for elements with modified text.
+        """
+        modified_xpath = []
+        # We only care about xpaths present in both, but with different text
+        common_xpaths = set(map_before.keys()) & set(map_after.keys())
+
+        for x in sorted(list(common_xpaths)):
+            text_before = map_before.get(x)
+            text_after = map_after.get(x)
+
+            # Check if text is not None for both and they are different
+            if (
+                text_before is not None
+                and text_before != ""
+                and text_after is not None
+                and text_after != ""
+                and text_before != text_after
+            ):
+                modified_xpath.append(x)
+        return modified_xpath
 
     async def safe_hover(
         self,
         page,
-        element:Locator,  
+        element: Locator,
         helper_id,
         *,
         timeout: int = 3000,  # ms for individual waits
@@ -1106,11 +1221,12 @@ class RecursiveScraper:
         Returns True on success, False otherwise.
         """
         start = time.time()
-        xpath_for_log = "[xpath_unavailable]" # Fallback log
+        xpath_for_log = "[xpath_unavailable]"  # Fallback log
         try:
             xpath_for_log = await element.evaluate(self.get_xpath_js)
         except Exception:
-            pass # Element might be gone, logging will use fallback
+            logging.error("Xpath of the element is unable to find")
+            pass  # Element might be gone, logging will use fallback
 
             # 1) Ensure visible & scrolled into view
         try:
@@ -1119,7 +1235,6 @@ class RecursiveScraper:
             logging.debug(
                 f"[helper {helper_id}] scroll_into_view_if_needed failed: {e}"
             )
-
 
         # Helper to abort if overall timeout passed
         def timed_out():
@@ -1144,7 +1259,7 @@ class RecursiveScraper:
 
         # 3) Try moving mouse to center using bounding box + page.mouse.move + mouseover
         try:
-            box = await page.bounding_box()
+            box = await element.bounding_box()
             if box:
                 cx = box["x"] + box["width"] / 2
                 cy = box["y"] + box["height"] / 2
@@ -1188,7 +1303,9 @@ class RecursiveScraper:
         # 4) Try force hover (shorter timeout)
         try:
             await element.hover(force=True, timeout=1000)
-            logging.info(f"[helper {helper_id}] Forced hover succeeded for {xpath_for_log}")
+            logging.info(
+                f"[helper {helper_id}] Forced hover succeeded for {xpath_for_log}"
+            )
             await page.wait_for_timeout(120)
             return True
         except Exception as e:
@@ -1204,7 +1321,7 @@ class RecursiveScraper:
 
         # 5) Check for intercepting element at center and temporarily disable it (pointer-events: none)
         try:
-            intercept_info = await element.evaluate(
+            intercept_info = await page.evaluate(
                 """
                 (el) => {
                     try {
@@ -1222,7 +1339,7 @@ class RecursiveScraper:
                         return { desc, original: original };
                     } catch (err) { return null; }
                 }
-                """
+                """,await element.element_handle()
             )
             if intercept_info:
                 logging.warning(
@@ -1319,104 +1436,6 @@ class RecursiveScraper:
             )
             logging.debug(traceback.format_exc())
             return False
-
-
-    async def get_xpath_bs(self, el):
-        parts = []
-        while el and getattr(el, "name", None):
-            parent = el.parent
-
-            # Stop before the document root
-            if not parent or getattr(parent, "name", None) in (
-                None,
-                "[document]",
-            ):
-                parts.append(el.name)
-                break
-
-            # Collect tag siblings in DOM order (ignore strings/comments)
-            same_tag_siblings = [
-                sib for sib in parent.children if getattr(sib, "name", None) == el.name
-            ]
-
-            # Determine index among siblings (1-based like XPath)
-            if len(same_tag_siblings) > 1:
-                try:
-                    index = same_tag_siblings.index(el) + 1
-                    parts.append(f"{el.name}[{index}]")
-                except ValueError:
-                    # fallback if BS made a copy or parsing glitch
-                    parts.append(f"{el.name}[1]")
-            else:
-                parts.append(el.name)
-
-            el = parent
-
-        parts.reverse()
-
-        # Fix duplicate /html/html case
-        if len(parts) >= 2 and parts[0] == "html" and parts[1] == "html":
-            parts = parts[1:]
-
-        return "/" + "/".join(parts)
-
-    async def extract_dom_structure(self, soup, created=True):
-        elements = []
-        for element in soup.find_all(True):  # True = all tags
-            xpath = await self.get_xpath_bs(element)
-
-            normalized_attrs = {}
-            for k, v in element.attrs.items():
-                if isinstance(v, list):
-                    normalized_attrs[k] = tuple(v)
-                else:
-                    normalized_attrs[k] = v
-
-            direct_texts = element.find_all(string=True, recursive=False)
-            direct_text = " ".join(t.strip() for t in direct_texts if t.strip())
-            data = {
-                "tag": element.name,
-                "attrs": normalized_attrs,
-                "xpath": xpath,
-                "text": direct_text,
-            }
-            elements.append(data)
-        return elements
-
-    async def compare_doms(self, old, new, helper_id, is_include_text=False):
-        # Filter out <body> elements
-        logging.info(f"helper {helper_id}: comparing doms to detect changes")
-        old_filtered = [e for e in old if e["tag"].lower() != "body"]
-        new_filtered = [
-            e
-            for e in new
-            if e["tag"].lower()
-            not in ["body", "style", "script", "meta", "link", "noscript"]
-        ]
-
-        if is_include_text:
-
-            def serialize_attrs(attrs):
-                return tuple(sorted((k, v) for k, v in attrs.items()))
-
-            logging.info(f"helper {helper_id} comparing doms with text included")
-            old_set = {(e["xpath"], e["text"]) for e in old_filtered}
-
-            # Keep the order of new elements
-            added = [
-                e["xpath"]
-                for e in new_filtered
-                if (e["xpath"], e["text"]) not in old_set
-            ]
-            logging.info(f"helper {helper_id}: Found added elements with text {added}")
-            return {"added": added}
-
-        old_set = {(e["xpath"]) for e in old_filtered}
-
-        # Keep the order of new elements
-        added = [(e["xpath"]) for e in new_filtered if (e["xpath"]) not in old_set]
-        logging.info(f"helper {helper_id}: Found added elements {added}")
-        return {"added": added}
 
     async def is_child_xpath(self, parent_xpath, child_xpath):
         """
@@ -1829,17 +1848,25 @@ class RecursiveScraper:
                         click_y = box["y"] + box["height"] / 2
 
                         await page.mouse.click(click_x, click_y)
-                        logging.info(f"helper {helper_id} Closed {popup_type} by clicking overlay at ({click_x:.1f},{click_y:.1f})")
+                        logging.info(
+                            f"helper {helper_id} Closed {popup_type} by clicking overlay at ({click_x:.1f},{click_y:.1f})"
+                        )
 
                         await asyncio.sleep(0.5)
 
                         if not await self._is_locator_visible_safe(popup_element):
-                            logging.info(f"helper {helper_id} {popup_type} closed after clicking overlay")
+                            logging.info(
+                                f"helper {helper_id} {popup_type} closed after clicking overlay"
+                            )
                             return True
                         else:
-                            logging.info(f"helper {helper_id} {popup_type} still visible after clicking overlay")
+                            logging.info(
+                                f"helper {helper_id} {popup_type} still visible after clicking overlay"
+                            )
                     else:
-                        logging.warning(f"helper {helper_id} Could not get bounding box for {popup_type}")
+                        logging.warning(
+                            f"helper {helper_id} Could not get bounding box for {popup_type}"
+                        )
 
                 except Exception as e:
                     logging.error(f"helper {helper_id} Error clicking overlay: {e}")
@@ -1976,7 +2003,7 @@ class RecursiveScraper:
     ):
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=True,
+                headless=False,
                 args=[
                     "--start-maximized",
                     "--disable-blink-features=AutomationControlled",
@@ -2090,21 +2117,21 @@ if __name__ == "__main__":
     #     )
     # )
 
-    # asyncio.run(
-    #     RecursiveScraper(
-    #         "https://app.instantly.ai/app/accounts", max_concurrency=5
-    #     ).run(
-    #         login_url="https://app.instantly.ai/auth/login",
-    #         username="sabarish@episyche.com",
-    #         password="Test@123!",
-    #         username_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[1]/input",
-    #         password_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[2]/input",
-    #         login_button_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[2]/div[1]/button",
-    #     )
-    # )
-
     asyncio.run(
         RecursiveScraper(
-           "http://localhost:3000/", max_concurrency=5, avoid_page=["tools", "blog"]
-        ).run()
+            "https://app.instantly.ai/app/accounts", max_concurrency=1
+        ).run(
+            login_url="https://app.instantly.ai/auth/login",
+            username="sabarish@episyche.com",
+            password="Test@123!",
+            username_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[1]/input",
+            password_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[2]/input",
+            login_button_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[2]/div[1]/button",
+        )
     )
+
+    # asyncio.run(
+    #     RecursiveScraper(
+    #         "http://localhost:3000/", max_concurrency=5, avoid_page=["tools", "blog"]
+    #     ).run()
+    # )
