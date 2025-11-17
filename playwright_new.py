@@ -3,6 +3,7 @@ from playwright.async_api import (
     async_playwright,
     Page,
     Locator,
+    ElementHandle,
     TimeoutError as PlaywrightTimeoutError,
 )
 import json
@@ -176,29 +177,6 @@ class RecursiveScraper:
         self.state = ThreadSafeState()
         netloc = re.sub(r"[^a-zA-Z0-9._-]", "_", parsed.netloc)
         self.db = Database_Handler(f"{netloc}.db")
-        self.script_visible_element = """
-            () => {
-                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, {
-                    acceptNode(node) {
-                        const style = window.getComputedStyle(node);
-                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-                            return NodeFilter.FILTER_REJECT;
-                        }
-                        const rect = node.getBoundingClientRect();
-                        if (rect.width === 0 || rect.height === 0) {
-                            return NodeFilter.FILTER_REJECT;
-                        }
-                        return NodeFilter.FILTER_ACCEPT;
-                    }
-                });
-                const visibleNodes = [];
-                let currentNode;
-                while ((currentNode = walker.nextNode())) {
-                    visibleNodes.push(currentNode.outerHTML);
-                }
-                return visibleNodes.join("\\n");
-            }
-            """
         self.avoid_page = avoid_page or []
         self.avoid_buttons = [
             "logout",
@@ -251,7 +229,7 @@ class RecursiveScraper:
 
         # Convert relative to absolute
         abs_url = urljoin(current_url, href)
-        abs_url = abs_url.split("?")[0]
+        # abs_url = abs_url.split("?")[0]
         abs_url = abs_url.split("#")[0]
 
         parsed_abs = urlparse(abs_url)
@@ -368,24 +346,29 @@ class RecursiveScraper:
             self.helper_pages[helper_id].add(page)
 
             success = False
-            for attempt in range(3): # Try 3 times
+            for attempt in range(3):  # Try 3 times
                 try:
-                    await page.goto(url, timeout=20000) # Increased timeout
+                    await page.goto(url, timeout=20000)  # Increased timeout
                     await self.wait_until_ready(
-                        page, timeout=20, settle_time=1, helper_id=helper_id # Increased timeout
+                        page,
+                        timeout=20,
+                        settle_time=5,
+                        helper_id=helper_id,  # Increased timeout
                     )
                     success = True
-                    break # Success!
+                    break  # Success!
                 except Exception as e:
                     logging.warning(
                         f"[helper {helper_id}] Attempt {attempt + 1}/3 failed for {url}: {e}"
                     )
-                    if attempt == 2: # Last attempt failed
-                        raise # Re-raise the exception to be caught by outer block
-                    await asyncio.sleep(3) # Wait 3 seconds before retrying
-            
+                    if attempt == 2:  # Last attempt failed
+                        raise  # Re-raise the exception to be caught by outer block
+                    await asyncio.sleep(3)  # Wait 3 seconds before retrying
+
             if not success:
-                logging.error(f"[helper {helper_id}] is unable to open the link {url} by 3 Attempts")
+                logging.error(
+                    f"[helper {helper_id}] is unable to open the link {url} by 3 Attempts"
+                )
                 return
 
             page_details = {
@@ -393,13 +376,16 @@ class RecursiveScraper:
                 "url": page.url,
                 "elements": [],
             }
-
+            await self.remove_widget(page=page)
+            
             popups = await self.detect_and_handle_popups(page, helper_id)
             if popups:
                 page_details["popups"] = popups
 
+            
+
             visible_elements_xpaths = await self.get_visible_elements_xpaths(
-                page=page, helper_id=helper_id
+                page=page, helper_id=helper_id, purpose="scrape_tab"
             )
             logging.info(
                 f"helper {helper_id}: Found {len(visible_elements_xpaths)} visible elements on {url}"
@@ -443,7 +429,7 @@ class RecursiveScraper:
                     logging.error(f"[helper {helper_id}] Error closing page: {e}")
 
     async def details_from_thre_xpath(
-        self, xpaths, page, url, helper_id, visible_elements_xpaths, hover_element=None
+        self, xpaths, page, url, helper_id, visible_elements_xpaths, hover_element=None,internal_route_element=None
     ):
         # to avoid click both parent and child elements
         previous_url = page.url
@@ -452,6 +438,7 @@ class RecursiveScraper:
         previous_element_xpath = None
         visible_elements = []
         clciked_xpaths = []
+        current_url = page.url
         for xpath in xpaths:
             is_dropdown_detected = False
             await self.pause_event.wait()
@@ -465,12 +452,36 @@ class RecursiveScraper:
                     logging.info(
                         f"[helper {helper_id}] Hovered over hover_element before processing: {await hover_element.evaluate(self.get_xpath_js)} in {url} for {xpath}"
                     )
-                element = page.locator(f"xpath={xpath}").first
+                element = page.locator(f"xpath={xpath}")
                 if not await element.count():
                     logging.warning(
-                        f"[helper {helper_id}] Element not found for XPath: {xpath} in {url}"
+                        f"[helper {helper_id}] Element not found for XPath: {xpath} in {url} let refresh the page and retrying..."
                     )
-                    continue
+
+                    # # await page.reload()
+                    await page.goto(current_url)
+                    await page.wait_for_load_state("domcontentloaded")
+                    await self.wait_until_ready(
+                        page, timeout=15, settle_time=2, helper_id=helper_id
+                    )
+                    await self.remove_widget(page=page)
+                    if internal_route_element:
+                        await self.safe_click(element,helper_id,xpath)
+                    if hover_element:
+                        await self.safe_hover(
+                            page,
+                            hover_element,
+                            helper_id=helper_id,
+                        )
+                        logging.info(
+                            f"[helper {helper_id}] Hovered over hover_element before processing: {await hover_element.evaluate(self.get_xpath_js)} in {url} for {xpath}"
+                        )
+                    element = page.locator(f"xpath={xpath}")
+                    if not await element.count():
+                        logging.warning(
+                            f"[helper {helper_id}] Element not found for XPath: {xpath} in {url} after refresh the page"
+                        )
+                        continue
 
                 tag = (await element.evaluate("(el) => el.tagName")).lower()
                 if tag in ["script", "style", "meta", "link", "noscript"]:
@@ -559,8 +570,6 @@ class RecursiveScraper:
                         page, visible_elements_xpaths, helper_id
                     )
                     hash_before_hover = await self.get_hash_from_map(map_before_hover)
-                    
-                    visible_elements_before_hover=await self.get_visible_elements_xpaths(page=page,helper_id=helper_id)
 
                     processed_text = (
                         await element.evaluate("(el) => el.innerText || ''")
@@ -572,6 +581,14 @@ class RecursiveScraper:
                         visible_elements.append(element_data)
                         parent_xpath = xpath
                         continue
+                    await self.wait_until_ready(
+                        page, timeout=10, settle_time=1.0, helper_id=helper_id
+                    )
+                    visible_elements_before_hover = (
+                        await self.get_visible_elements_xpaths(
+                            page=page, helper_id=helper_id, purpose="before_hover"
+                        )
+                    )
                     hovered = await self.safe_hover(page, element, helper_id)
                     if not hovered:
                         logging.info(
@@ -629,20 +646,12 @@ class RecursiveScraper:
                         logging.info(
                             f"[helper {helper_id}] Clicking element: {xpath} in {url} "
                         )
-                        try:
-                            await element.click()
-                        except Exception:
-                            # fallback to JS click on element handle
-                            handle = await element.element_handle()
-                            if handle:
-                                try:
-                                    await handle.evaluate("(el) => el.click()")
-                                except Exception as e:
-                                    logging.error(
-                                        f"[helper {helper_id}] JS click failed for {xpath} in {url}: {e}"
-                                    )
-                                    visible_elements.append(element_data)
-                                    continue
+                        clicked = await self.safe_click(
+                            locator=element, helper_id=helper_id, xpath=xpath
+                        )
+                        if not clicked:
+                            visible_elements.append(element_data)
+                            continue
 
                         parent_xpath = xpath
                         clciked_xpaths.append(xpath)
@@ -689,6 +698,8 @@ class RecursiveScraper:
                             await self.wait_until_ready(
                                 page, timeout=10, settle_time=1.0, helper_id=helper_id
                             )
+                            if internal_route_element:
+                                await self.safe_click(internal_route_element,helper_id=helper_id,xpath=await internal_route_element.evaluate(self.get_xpath_js))
 
                         except asyncio.TimeoutError:
                             # No popup opened, check for same-tab navigation
@@ -704,8 +715,8 @@ class RecursiveScraper:
                             # )
 
                             if page.url != previous_url:
-                                new_url = page.url.split("?")[0].split("#")[0]
-                                # new_url = page.url.split("#")[0]
+                                # new_url = page.url.split("?")[0].split("#")[0]
+                                new_url = page.url.split("#")[0]
                                 element_data["navigated_to"] = new_url
                                 await self.state.add_navigation(key_hash, new_url)
                                 logging.info(
@@ -731,6 +742,8 @@ class RecursiveScraper:
                                 await self.safe_go_back(
                                     page, helper_id, previous_url=previous_url
                                 )
+                                if internal_route_element:
+                                    await self.safe_click(internal_route_element,helper_id=helper_id,xpath=await internal_route_element.evaluate(self.get_xpath_js))
 
                             else:
                                 popup_data = await self.detect_and_handle_popups(
@@ -761,7 +774,7 @@ class RecursiveScraper:
                                 )
                                 visible_xpaths_after = (
                                     await self.get_visible_elements_xpaths(
-                                        page, helper_id
+                                        page, helper_id, purpose="after_click"
                                     )
                                 )
                                 map_after = await self.get_visible_content_map(
@@ -778,6 +791,13 @@ class RecursiveScraper:
                                                 clciked_xpaths.index(xpath) - 1
                                             ]
                                             if clciked_xpaths.index(xpath) > 0
+                                            and await self.have_same_parents(
+                                                page=page,
+                                                xpath1=clciked_xpaths[
+                                                    clciked_xpaths.index(xpath) - 1
+                                                ],
+                                                xpath2=xpath,
+                                            )
                                             else None
                                         )
                                     logging.info(
@@ -791,8 +811,9 @@ class RecursiveScraper:
 
                                     if new_xpaths:
                                         logging.info(
-                                            f"[helper {helper_id}] Found {len(new_xpaths)} new elements (internal routes)."
+                                            f"[helper {helper_id}] Found {len(new_xpaths)} new elements internal routes {new_xpaths}."
                                         )
+
                                         element_data["internal_routes"] = (
                                             await self.details_from_thre_xpath(
                                                 new_xpaths,  # Process only the new elements
@@ -800,157 +821,72 @@ class RecursiveScraper:
                                                 url,
                                                 helper_id,
                                                 visible_xpaths_after,  # Pass the new full list
+                                                internal_route_element=element
                                             )
                                         )
-                                        if previous_element_xpath:
-                                            previous_element = page.locator(
-                                                f"xpath={previous_element_xpath}"
-                                            )
+                                        managed_ir = await self.manage_internal_navigation(
+                                            page=page,
+                                            element=element,
+                                            helper_id=helper_id,
+                                            previous_element_xpath=previous_element_xpath,
+                                            previous_url=previous_url,
+                                            hash_before=hash_before,
+                                        )
+                                        if managed_ir:
                                             logging.info(
-                                                f"[helper {helper_id}] Returning to previous element {previous_element_xpath} after DOM change."
+                                                f"[Helper {helper_id}]: managed the internal routes in {page.url}"
                                             )
-                                            try:
-                                                await previous_element.click()
-                                            except Exception:
-                                                # fallback to JS click on element handle
-                                                previous_handle = (
-                                                    await previous_element.element_handle()
-                                                )
-                                                if handle:
-                                                    try:
-                                                        await previous_handle.evaluate(
-                                                            "(el) => el.click()"
-                                                        )
-                                                    except Exception as e:
-                                                        logging.error(
-                                                            f"[helper {helper_id}] JS click failed for {xpath} in {url}: {e}"
-                                                        )
-                                                        visible_elements.append(
-                                                            element_data
-                                                        )
-                                                        continue
-                                            await self.wait_until_ready(
-                                                page,
-                                                timeout=15,
-                                                settle_time=1,
-                                                helper_id=helper_id,
-                                            )
-
                                         else:
                                             logging.info(
-                                                f"[helper {helper_id}] No previous element to return to after DOM change so clciking the same elements."
+                                                f"[helper {helper_id}] unable to manage internal routes"
                                             )
-                                            try:
-                                                await element.click()
-                                            except Exception:
-                                                # fallback to JS click on element handle
-                                                handle = await element.element_handle()
-                                                if handle:
-                                                    try:
-                                                        await handle.evaluate(
-                                                            "(el) => el.click()"
-                                                        )
-                                                    except Exception as e:
-                                                        logging.error(
-                                                            f"[helper {helper_id}] JS click failed for {xpath} in {url}: {e}"
-                                                        )
-                                                        visible_elements.append(
-                                                            element_data
-                                                        )
-                                                        continue
-                                            await self.wait_until_ready(
-                                                page,
-                                                timeout=15,
-                                                settle_time=1,
-                                                helper_id=helper_id,
-                                            )
+
                                     else:
-                                        # No new XPaths, so the change must be in-place.
-                                        logging.info(
-                                            f"[helper {helper_id}] DOM changed: Content was modified in-place."
-                                        )
                                         modified_xpath = (
                                             self._get_modified_elements_data(
                                                 map_before, map_after
                                             )
                                         )
-                                        element_data["internal_routes"] = (
-                                            await self.details_from_thre_xpath(
-                                                modified_xpath,  # Process only the new elements
-                                                page,
-                                                url,
-                                                helper_id,
-                                                visible_xpaths_after,  # Pass the new full list
-                                            )
-                                        )
-
-                                        if previous_element_xpath:
-                                            previous_element = page.locator(
-                                                f"xpath={previous_element_xpath}"
-                                            )
+                                        if modified_xpath:
+                                            # No new XPaths, so the change must be in-place.
                                             logging.info(
-                                                f"[helper {helper_id}] Returning to previous element {previous_element_xpath} after DOM change."
+                                                f"[helper {helper_id}] DOM changed: Content was modified in-place {modified_xpath}."
                                             )
-                                            try:
-                                                await previous_element.click()
-                                            except Exception:
-                                                # fallback to JS click on element handle
-                                                previous_handle = (
-                                                    await previous_element.element_handle()
+
+                                            element_data["internal_routes"] = (
+                                                await self.details_from_thre_xpath(
+                                                    modified_xpath,  # Process only the new elements
+                                                    page,
+                                                    url,
+                                                    helper_id,
+                                                    visible_xpaths_after,
+                                                    internal_route_element=element# Pass the new full list
                                                 )
-                                                if handle:
-                                                    try:
-                                                        await previous_handle.evaluate(
-                                                            "(el) => el.click()"
-                                                        )
-                                                    except Exception as e:
-                                                        logging.error(
-                                                            f"[helper {helper_id}] JS click failed for {xpath} in {url}: {e}"
-                                                        )
-                                                        visible_elements.append(
-                                                            element_data
-                                                        )
-                                                        continue
-                                            await self.wait_until_ready(
-                                                page,
-                                                timeout=15,
-                                                settle_time=1,
-                                                helper_id=helper_id,
                                             )
 
                                         else:
                                             logging.info(
-                                                f"[helper {helper_id}] No previous element to return to after DOM change so clciking the same elements."
+                                                f"[helper {helper_id}] DOM changed but no new elements detected or some elements removed after click on {xpath} in {url}."
                                             )
-                                            try:
-                                                await element.click()
-                                            except Exception:
-                                                # fallback to JS click on element handle
-                                                handle = await element.element_handle()
-                                                if handle:
-                                                    try:
-                                                        await handle.evaluate(
-                                                            "(el) => el.click()"
-                                                        )
-                                                    except Exception as e:
-                                                        logging.error(
-                                                            f"[helper {helper_id}] JS click failed for {xpath} in {url}: {e}"
-                                                        )
-                                                        visible_elements.append(
-                                                            element_data
-                                                        )
-                                                        continue
-                                            await self.wait_until_ready(
-                                                page,
-                                                timeout=15,
-                                                settle_time=1,
-                                                helper_id=helper_id,
+                                        managed_ir = await self.manage_internal_navigation(
+                                            page=page,
+                                            element=element,
+                                            helper_id=helper_id,
+                                            previous_element_xpath=previous_element_xpath,
+                                            previous_url=previous_url,
+                                            hash_before=hash_before,
+                                        )
+                                        if managed_ir:
+                                            logging.info(
+                                                f"[Helper {helper_id}]: managed the internal routes in {page.url}"
                                             )
-                                    # else:
-                                    #     logging.info(
-                                    #         f"[helper {helper_id}] DOM changed but no new elements detected after click on {xpath} in {url}."
-                                    #     )
-                                    #     previous_element_xpath = None
+                                        else:
+                                            logging.warning(
+                                                f"[helper {helper_id}] unable to manage internal routes in {page.url}"
+                                            )
+                                    if internal_route_element:
+                                        await self.safe_click(internal_route_element,helper_id=helper_id,xpath=await internal_route_element.evaluate(self.get_xpath_js))            
+
                                 else:
                                     logging.info(
                                         f"[helper {helper_id}] DOM did not change after click on {xpath} in {url}."
@@ -972,30 +908,319 @@ class RecursiveScraper:
 
         return visible_elements
 
-    async def safe_go_back(self, page, helper_id, previous_url=None):
-        """Safely go back in browser history or reload previous URL if needed."""
+    async def have_same_parents(self, page, xpath1: str, xpath2: str) -> bool:
+        logging.info(f"xpath 1: {xpath1}  ,xpath 2 :{xpath2}")
+        js = r"""
+    ({ xp1, xp2 }) => {
+        function getNode(xp) {
+            return document.evaluate(
+                xp, document, null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null
+            ).singleNodeValue;
+        }
+        function buildAncestors(node) {
+            const arr = [];
+            let cur = node;
+            while (cur && cur.nodeType === 1) {
+                arr.unshift(cur); // root first
+                cur = cur.parentElement;
+            }
+            return arr;
+        }
+        function tagPathFromAncestor(ancestor, node) {
+            const tags = [];
+            let cur = node;
+            while (cur && cur !== ancestor) {
+                if (cur.nodeType === 1) tags.unshift(cur.nodeName.toLowerCase());
+                cur = cur.parentElement;
+            }
+            return tags;
+        }
+
+        const n1 = getNode(xp1);
+        const n2 = getNode(xp2);
+        if (!n1 || !n2) return false;
+
+        const anc1 = buildAncestors(n1);
+        const anc2 = buildAncestors(n2);
+        if (anc1.length !== anc2.length) return false; // require same depth
+
+        // QUICK sibling check: same immediate parent => True
+        const p1 = n1.parentElement;
+        const p2 = n2.parentElement;
+        if (p1 && p2 && p1 === p2) {
+            // optional: ensure tag-path from parent down to nodes is same length & tags
+            const path1 = tagPathFromAncestor(p1, n1); // from parent (exclusive) => n1
+            const path2 = tagPathFromAncestor(p2, n2);
+            if (path1.length !== path2.length) return false;
+            for (let i = 0; i < path1.length; i++) {
+                if (path1[i] !== path2[i]) return false;
+            }
+            return true;
+        }
+
+        const depth = anc1.length;
+        for (let k = 1; k < depth; k++) {
+            const idx = depth - 1 - k;
+            const a1 = anc1[idx];
+            const a2 = anc2[idx];
+            if (!a1 || !a2) continue;
+            if (a1 === a2) continue; // same ancestor at this level — skip
+
+            const pa1 = a1.parentElement;
+            const pa2 = a2.parentElement;
+            if (!pa1 || !pa2) continue;
+            if (pa1 !== pa2) continue; // ancestors must be siblings
+
+            const path1 = tagPathFromAncestor(a1, n1);
+            const path2 = tagPathFromAncestor(a2, n2);
+            if (path1.length !== path2.length) continue;
+
+            let same = true;
+            for (let x = 0; x < path1.length; x++) {
+                if (path1[x] !== path2[x]) { same = false; break; }
+            }
+            if (same) return true;
+        }
+        return false;
+    }
+    """
+
+        return await page.evaluate(js, {"xp1": xpath1, "xp2": xpath2})
+
+    async def safe_click(
+        self,
+        locator: Locator,
+        helper_id: str,
+        xpath: Optional[str] = None,
+        timeout: float = 5000,
+    ) -> bool:
+        """
+        Try to click a locator robustly:
+        1. wait for it to be visible & enabled
+        2. try locator.click()
+        3. fallback to JS click on the element
+        Returns True on success, False on failure.
+        """
         try:
+            # Wait for the element to be visible and actionable
+            await locator.wait_for(state="visible", timeout=timeout)
+        except PlaywrightTimeoutError:
+            logging.warning(
+                f"[helper {helper_id}] element not visible (xpath={xpath}) after {timeout}ms."
+            )
+            return False
+
+        try:
+            await locator.click()
+            logging.info(
+                f"[helper {helper_id}] clicked element (xpath={xpath}) via locator.click()."
+            )
+            return True
+        except Exception as exc:
+            logging.warning(
+                f"[helper {helper_id}] locator.click failed for (xpath={xpath}): {exc}. Trying JS click fallback."
+            )
+            # fallback to JS click using evaluate on an element handle
+            try:
+                await locator.evaluate("(el) => el.click()")
+                logging.info(
+                    f"[helper {helper_id}] clicked element (xpath={xpath}) via JS fallback."
+                )
+                return True
+            except Exception as exc2:
+                logging.error(
+                    f"[helper {helper_id}] JS click fallback failed for (xpath={xpath}): {exc2}"
+                )
+                return False
+
+    async def manage_internal_navigation(
+        self,
+        page: Page,
+        element: Locator,
+        helper_id: str,
+        previous_element_xpath: Optional[str],
+        previous_url: str,
+        hash_before: str,
+    ) -> bool:
+        """
+        Try to return to a previous element (if provided) after a DOM change,
+        otherwise click the given element again. After clicking, wait until ready,
+        verify URL and DOM hash. Returns True if returned to original state (hash matches),
+        False otherwise.
+        """
+        async def refresh_and_check()->bool:
+            await page.goto(previous_url)
+            await self.wait_until_ready(page=page,timeout=15,settle_time=5,helper_id=helper_id)
+            await self.remove_widget(page=page)
+            xpaths_here = await self.get_visible_elements_xpaths(
+                page=page,
+                helper_id=helper_id,
+                purpose="comparing the dom for after inter routes detected",
+            )
+            map_here = await self.get_visible_content_map(
+                page=page, xpaths=xpaths_here, helper_id=helper_id
+            )
+            hash_here = await self.get_hash_from_map(content_map=map_here)
+
+            if hash_before == hash_here:
+                logging.info(
+                    f"[helper {helper_id}] returned to the original state in {page.url} after refreshing the page"
+                )
+                return True
+            else:
+                logging.info(
+                    f"[helper {helper_id}] state changed: previous hash != current hash after refreshing the page (page.url={page.url})"
+                )
+                return False
+            
+
+        async def post_click_checks() -> bool:
+            # common post-click sequence
+            await self.wait_until_ready(
+                page, timeout=15, settle_time=1, helper_id=helper_id
+            )
+
+            # If click navigated to wrong URL, navigate back and remove widget
+            if previous_url != page.url:
+                logging.info(
+                    f"[helper {helper_id}] clicked wrong element; navigating to {previous_url}"
+                )
+                try:
+                    await page.goto(previous_url)
+                    await self.wait_until_ready(
+                        page=page, timeout=15, settle_time=2, helper_id=helper_id
+                    )
+                    await self.remove_widget(page=page)
+                except Exception as exc:
+                    logging.error(
+                        f"[helper {helper_id}] failed to navigate back to previous_url {previous_url}: {exc}"
+                    )
+
+            # compute current visible map & hash
+            xpaths_here = await self.get_visible_elements_xpaths(
+                page=page,
+                helper_id=helper_id,
+                purpose="comparing the dom for after inter routes detected",
+            )
+            map_here = await self.get_visible_content_map(
+                page=page, xpaths=xpaths_here, helper_id=helper_id
+            )
+            hash_here = await self.get_hash_from_map(content_map=map_here)
+
+            if hash_before == hash_here:
+                logging.info(
+                    f"[helper {helper_id}] returned to the original state in {page.url}"
+                )
+                return True
+            else:
+                logging.info(
+                    f"[helper {helper_id}] state changed: previous hash != current hash (page.url={page.url})"
+                )
+                return False
+
+        # Main flow: try to go back to previous element if provided, else click the provided element
+        if previous_element_xpath:
+            previous_element = page.locator(f"xpath={previous_element_xpath}")
+            logging.info(
+                f"[helper {helper_id}] Returning to previous element {previous_element_xpath} after DOM change."
+            )
+            clicked = await self.safe_click(
+                previous_element, helper_id, xpath=previous_element_xpath
+            )
+            if not clicked:
+                logging.warning(
+                    f"[helper {helper_id}] failed to click previous element ({previous_element_xpath}); attempting to continue."
+                )
+            if await post_click_checks():
+                return True
+            return await refresh_and_check()
+        
+        else:
+            logging.info(
+                f"[helper {helper_id}] No previous element to return to after DOM change — clicking the same element."
+            )
+            # Try to extract the xpath for better logging if available
+            xpath_for_log = await element.evaluate(self.get_xpath_js)
+
+            clicked = await self.safe_click(
+                element, helper_id, xpath=xpath_for_log, timeout=5000
+            )
+            if not clicked:
+                logging.warning(
+                    f"[helper {helper_id}] failed to click the element (xpath={xpath_for_log}); continuing to checks."
+                )
+            if await post_click_checks():
+                return True
+            return await refresh_and_check()
+
+    async def safe_go_back(self, page, helper_id, previous_url):
+        """Safely go back in browser history or reload previous URL if needed."""
+
+        async def ensure_correct_url():
+            """Verify and correct the URL if mismatch."""
+            if previous_url and page.url != previous_url:
+                logging.warning(
+                    f"[helper {helper_id}] URL mismatch after go_back(). "
+                    f"Expected: {previous_url}, Got: {page.url}. Fixing..."
+                )
+                await page.goto(previous_url, wait_until="domcontentloaded")
+                await self.wait_until_ready(
+                    page, timeout=15, settle_time=1, helper_id=helper_id
+                )
+                await self.remove_widget(page=page)
+                logging.info(f"[helper {helper_id}] URL corrected successfully.")
+
+        try:
+            # attempt normal browser history back
             await page.go_back(timeout=10000, wait_until="domcontentloaded")
             await page.wait_for_load_state("domcontentloaded")
             await self.wait_until_ready(
                 page, timeout=15, settle_time=1, helper_id=helper_id
             )
-            logging.info(f"helper {helper_id} Went back successfully.")
+            await self.remove_widget(page=page)
+
+            logging.info(
+                f"[helper {helper_id}] Went back successfully using go_back()."
+            )
+
+            # verify URL after go_back
+            await ensure_correct_url()
+
         except Exception:
             logging.warning(
-                f"helper {helper_id} :go_back() failed, using fallback navigation..."
+                f"[helper {helper_id}] go_back() failed, using js fallback ..."
             )
-            if previous_url:
-                await page.goto(previous_url, wait_until="domcontentloaded")
-                await self.wait_until_ready(
-                    page, timeout=15, settle_time=1, helper_id=helper_id
-                )
-            else:
+
+            try:
+                #  JS history fallback
                 await page.evaluate("window.history.back()")
                 await page.wait_for_load_state("domcontentloaded")
                 await self.wait_until_ready(
                     page, timeout=15, settle_time=1, helper_id=helper_id
                 )
+                await self.remove_widget(page=page)
+                logging.info(
+                    f"[helper {helper_id}] Went back using JS fallback successfully."
+                )
+
+            except Exception:
+                logging.warning(
+                    f"[helper {helper_id}] js go back failed, using js fallback ..."
+                )
+                # known previous URL? → direct navigation fallback
+                await page.goto(previous_url, wait_until="domcontentloaded")
+                await self.wait_until_ready(
+                    page, timeout=15, settle_time=1, helper_id=helper_id
+                )
+                await self.remove_widget(page=page)
+                logging.info(
+                    f"[helper {helper_id}] Fallback navigation to previous URL succeeded."
+                )
+
+            # verify URL after fallback
+            await ensure_correct_url()
 
     async def detect_dropdown_after_hover(
         self,
@@ -1012,7 +1237,7 @@ class RecursiveScraper:
                 page=page, timeout=5, settle_time=1, helper_id=helper_id
             )
             visible_xpaths_after_hover = await self.get_visible_elements_xpaths(
-                page, helper_id
+                page, helper_id, purpose="after_hover"
             )
             map_after_hover = await self.get_visible_content_map(
                 page, visible_xpaths_after_hover, helper_id
@@ -1040,9 +1265,11 @@ class RecursiveScraper:
                     )
                     return dropdown_data
                 else:
+
                     modified_xpath = self._get_modified_elements_data(
                         map_before_hover, map_after_hover
                     )
+                    logging.info(f"helper {helper_id} modified xpath{modified_xpath}")
                     dropdown_data = await self.details_from_thre_xpath(
                         modified_xpath,
                         page,
@@ -1061,49 +1288,67 @@ class RecursiveScraper:
             logging.error(f"Traceback:\n{traceback.format_exc()}")
             return None
 
-    async def get_visible_elements_xpaths(self, page, helper_id):
-        """Get xpaths of all visible elements on the page using Playwright locators."""
+    async def get_single_xpath(
+        self, element_handle: ElementHandle, helper_id: int, i: int
+    ) -> str | None:
+        """Tries to get a single visible element's xpath. Returns None on failure."""
         try:
-            await self.wait_until_ready(page=page,timeout=5,settle_time=1)
-            # Use locator instead of query_selector
-            body = page.locator("body")
+            if await element_handle.is_visible():
+                return await element_handle.evaluate(self.get_xpath_js)
+        except Exception as e:
+            logging.warning(
+                f" helper {helper_id} : Concurrent error on element {i} : {e}"
+            )
+        return None
 
-            # Check if body exists
-            if not await body.count():
+    async def get_visible_elements_xpaths(
+        self, page: Page, helper_id: int, purpose=None
+    ) -> List[str]:
+        """Get xpaths of all visible elements CONCURRENTLY."""
+        try:
+            await self.wait_until_ready(page=page, timeout=5, settle_time=1)
+
+            # 1. Define your locator
+            selector = "body *:not(script):not(style):not(meta):not(noscript):not(link):not(title)"
+
+            # 2. Get the stable "snapshot" list of locators
+            try:
+                all_handles = await page.query_selector_all(selector)
+            except PlaywrightTimeoutError:
+                logging.warning(
+                    f" helper {helper_id} : Timed out getting initial element list in  {purpose}."
+                )
                 return []
 
-            skip_tags = {
-                "script",
-                "style",
-                "meta",
-                "noscript",
-            }
-            # Create a locator for all elements under <body>
-            all_elements = body.locator("*")
-            total = await all_elements.count()
+            total = len(all_handles)
+            if total == 0:
+                logging.info(
+                    f" helper {helper_id} : No elements found to process in {page.url} in {purpose}"
+                )
+                return []
+
             logging.info(
-                f" helper {helper_id} : found {total} element in the {page.url}"
+                f" helper {helper_id} : found {total} elements in {purpose}. Processing CONCURRENTLY."
             )
-            xpaths = []
 
-            # Iterate through each element
-            for i in range(total):
-                element = all_elements.nth(i)
-                try:
-                    tag_name = await element.evaluate(
-                        "(el) => el.tagName.toLowerCase()"
-                    )
-                    if tag_name in skip_tags:
-                        continue  # skip unwanted tags
-                    if await element.is_visible():
-                        xpath = await element.evaluate(self.get_xpath_js)
-                        xpaths.append(xpath)
-                except Exception as e:
-                    logging.warning(
-                        f" helper {helper_id} : Error processing element {i}: {e}"
-                    )
-                    continue
+            # 3.Create a list of tasks (coroutines) to run
+            tasks = []
+            for i, element_handle in enumerate(all_handles):
+                tasks.append(
+                    # Call our helper for each element
+                    self.get_single_xpath(element_handle, helper_id, i)
+                )
 
+            # 4. Run all tasks concurrently and get results
+            # This is where the speed comes from!
+            results = await asyncio.gather(*tasks)
+
+            # 5. Filter out the None values (from failed/invisible elements)
+            xpaths = [xpath for xpath in results if xpath is not None]
+
+            logging.info(
+                f" helper {helper_id} : Successfully extracted {len(xpaths)} visible xpaths in {purpose}."
+            )
             return xpaths
 
         except Exception as e:
@@ -1177,7 +1422,7 @@ class RecursiveScraper:
 
     def _get_modified_elements_data(
         self, map_before: Dict[str, str], map_after: Dict[str, str]
-    ) -> List[Dict[str, str]]:
+    ) -> List[str]:
         """
         Compares two content maps and returns a list of dictionaries
         for elements with modified text.
@@ -1339,7 +1584,8 @@ class RecursiveScraper:
                         return { desc, original: original };
                     } catch (err) { return null; }
                 }
-                """,await element.element_handle()
+                """,
+                await element.element_handle(),
             )
             if intercept_info:
                 logging.warning(
@@ -1466,7 +1712,9 @@ class RecursiveScraper:
             if role == "button":
                 return True
 
-            cursor = await element.evaluate("(el) => getComputedStyle(el).cursor")
+            cursor = (
+                await element.evaluate("(el) => getComputedStyle(el).cursor")
+            ).lower()
             if cursor == "pointer":
                 return True
 
@@ -1522,7 +1770,6 @@ class RecursiveScraper:
 
             for selector in modal_selectors:
                 elements = await page.locator(f"xpath={selector}").element_handles()
-                visible_modals = []
                 for el in elements:
                     try:
                         is_visible = await el.is_visible()
@@ -1537,20 +1784,17 @@ class RecursiveScraper:
                             logging.info(
                                 f"helper {helper_id} Modal size: {size} for selector: {selector}"
                             )
-                            visible_modals.append(el)
+                            modal = el
+                            logging.info(
+                                f"helper {helper_id} Modal detected using selector: {selector}of  {await modal.evaluate(self.get_xpath_js)}"
+                            )
+                            popup_data = await self.extract_popup_details(
+                                page, modal, "modal", helper_id
+                            )
+                            await self.close_popup(page, modal, "modal", helper_id)
+                            return popup_data
                     except Exception:
                         continue
-
-                if visible_modals:
-                    modal = visible_modals[0]
-                    logging.info(
-                        f"helper {helper_id} Modal detected using selector: {selector}of  {await modal.evaluate(self.get_xpath_js)}"
-                    )
-                    popup_data = await self.extract_popup_details(
-                        page, modal, "modal", helper_id
-                    )
-                    await self.close_popup(page, modal, "modal", helper_id)
-                    return popup_data
 
             # --- 2. Tooltips ---
             tooltip_selectors = [
@@ -1570,7 +1814,7 @@ class RecursiveScraper:
 
             for selector in tooltip_selectors:
                 elements = await page.locator(f"xpath={selector}").element_handles()
-                visible_tooltips = []
+
                 for el in elements:
                     try:
                         is_visible = await el.is_visible()
@@ -1585,20 +1829,17 @@ class RecursiveScraper:
                             logging.info(
                                 f"helper {helper_id} Tooltip size: {size} for selector: {selector}"
                             )
-                            visible_tooltips.append(el)
+                            tooltip = el
+                            logging.info(
+                                f"helper {helper_id} Tooltip detected using selector :{selector} of {await tooltip.evaluate(self.get_xpath_js)}"
+                            )
+                            popup_data = await self.extract_popup_details(
+                                page, tooltip, "tooltip", helper_id
+                            )
+                            await self.close_popup(page, tooltip, "tooltip", helper_id)
+                            return popup_data
                     except Exception:
                         continue
-
-                if visible_tooltips:
-                    tooltip = visible_tooltips[0]
-                    logging.info(
-                        f"helper {helper_id} Tooltip detected using selector :{selector} of {await tooltip.evaluate(self.get_xpath_js)}"
-                    )
-                    popup_data = await self.extract_popup_details(
-                        page, tooltip, "tooltip", helper_id
-                    )
-                    await self.close_popup(page, tooltip, "tooltip", helper_id)
-                    return popup_data
 
             # --- 3. Overlays ---
             overlay_selectors = [
@@ -1633,7 +1874,7 @@ class RecursiveScraper:
 
             for selector in overlay_selectors:
                 elements = await page.locator(f"xpath={selector}").element_handles()
-                visible_overlays = []
+
                 for el in elements:
                     try:
                         is_visible = await el.is_visible()
@@ -1648,20 +1889,17 @@ class RecursiveScraper:
                             logging.info(
                                 f"helper {helper_id} Overlay size: {size} for selector: {selector}"
                             )
-                            visible_overlays.append(el)
+                            overlay = el
+                            logging.info(
+                                f"helper {helper_id} Overlay detected using selector: {selector} of {await overlay.evaluate(self.get_xpath_js)}"
+                            )
+                            popup_data = await self.extract_popup_details(
+                                page, overlay, "overlay", helper_id
+                            )
+                            await self.close_popup(page, overlay, "overlay", helper_id)
+                            return popup_data
                     except Exception:
                         continue
-
-                if visible_overlays:
-                    overlay = visible_overlays[0]
-                    logging.info(
-                        f"helper {helper_id} Overlay detected using selector: {selector} of {await overlay.evaluate(self.get_xpath_js)}"
-                    )
-                    popup_data = await self.extract_popup_details(
-                        page, overlay, "overlay", helper_id
-                    )
-                    await self.close_popup(page, overlay, "overlay", helper_id)
-                    return popup_data
 
         except Exception as e:
             logging.error(f"Error detecting popups: {e}")
@@ -1792,9 +2030,9 @@ class RecursiveScraper:
                 ".//button[contains(@class,'top-') and contains(@class,'right-')]",
                 ".//*[contains(@class,'absolute') and contains(@class,'right') and contains(@class,'top') and (.//svg or .//span)]",
                 # === 7️⃣ Generic clickable wrappers (fallbacks) ===
-                ".//*[contains(@class,'cursor-pointer') and (.//svg or .//span or .//path)]",
-                ".//*[@role='button' and (.//svg or .//span)][contains(@class,'close') or contains(@class,'toggle') or contains(@class,'top-')]",
-                ".//div[(contains(@class,'pointer') or contains(@class,'click')) and (.//svg or .//*[contains(@class,'close')])]",
+                # ".//*[contains(@class,'cursor-pointer') and (.//svg or .//span or .//path)]",
+                # ".//*[@role='button' and (.//svg or .//span)][contains(@class,'close') or contains(@class,'toggle') or contains(@class,'top-')]",
+                # ".//div[(contains(@class,'pointer') or contains(@class,'click')) and (.//svg or .//*[contains(@class,'close')])]",
                 # === 8️⃣ Special cases (newsletter, cookie, chat, overlay, GDPR) ===
                 ".//*[contains(text(),'No thanks') or contains(text(),'no thanks') or contains(text(),'Got it') or contains(text(),'Accept all')]",
                 ".//*[contains(@id,'close') or contains(@id,'dismiss') or contains(@id,'cancel') or contains(@id,'exit')]",
@@ -1837,46 +2075,138 @@ class RecursiveScraper:
                     )
 
             # Click outside for tooltips/dropdowns
-            if popup_type in ["overlay"]:
+            if popup_type in ["modal", "overlay", "dropdown"]:
                 try:
-                    # Get the bounding box of the popup element
+                    # Get bounding box of the popup element
                     box = await popup_element.bounding_box()
 
-                    if box:
-                        # Pick a point safely inside the overlay (e.g., center)
-                        click_x = box["x"] + box["width"] / 2
-                        click_y = box["y"] + box["height"] / 2
-
-                        await page.mouse.click(click_x, click_y)
-                        logging.info(
-                            f"helper {helper_id} Closed {popup_type} by clicking overlay at ({click_x:.1f},{click_y:.1f})"
-                        )
-
-                        await asyncio.sleep(0.5)
-
-                        if not await self._is_locator_visible_safe(popup_element):
-                            logging.info(
-                                f"helper {helper_id} {popup_type} closed after clicking overlay"
-                            )
-                            return True
-                        else:
-                            logging.info(
-                                f"helper {helper_id} {popup_type} still visible after clicking overlay"
-                            )
-                    else:
+                    if not box:
                         logging.warning(
                             f"helper {helper_id} Could not get bounding box for {popup_type}"
                         )
+                        logging.warning(
+                            f"helper {helper_id} Could not close {popup_type}"
+                        )
+                        return False
+
+                    # Get viewport size (fallback to evaluate if page.viewport_size is None)
+                    viewport = page.viewport_size
+                    if not viewport:
+                        viewport = await page.evaluate(
+                            "() => ({ width: window.innerWidth, height: window.innerHeight })"
+                        )
+
+                    vw = viewport["width"]
+                    vh = viewport["height"]
+
+                    x, y, w, h = box["x"], box["y"], box["width"], box["height"]
+
+                    # Candidate points just outside the bounding box (10px padding)
+                    padding = 10
+                    candidates = [
+                        (x + w + padding, y + h / 2),  # right middle
+                        (x - padding, y + h / 2),  # left middle
+                        (x + w / 2, y - padding),  # top middle
+                        (x + w / 2, y + h + padding),  # bottom middle
+                        (x - padding, y - padding),  # top-left corner outside
+                        (x + w + padding, y - padding),  # top-right
+                        (x - padding, y + h + padding),  # bottom-left
+                        (x + w + padding, y + h + padding),  # bottom-right
+                    ]
+
+                    # Clamp candidate points into viewport and filter valid ones
+                    def clamp(px, py):
+                        px = max(1, min(px, vw - 1))
+                        py = max(1, min(py, vh - 1))
+                        return px, py
+
+                    candidates = [clamp(px, py) for px, py in candidates]
+
+                    clicked = False
+                    for idx, (click_x, click_y) in enumerate(candidates):
+                        try:
+                            await page.mouse.click(click_x, click_y)
+                            logging.info(
+                                f"helper {helper_id} Tried clicking outside overlay at ({click_x:.1f},{click_y:.1f}) (candidate {idx})"
+                            )
+                            clicked = True
+
+                            # short wait for any close animation / DOM change
+                            await asyncio.sleep(0.25)
+
+                            if not await self._is_locator_visible_safe(popup_element):
+                                logging.info(
+                                    f"helper {helper_id} {popup_type} closed after clicking outside at ({click_x:.1f},{click_y:.1f})"
+                                )
+                                return True
+                            else:
+                                logging.info(
+                                    f"helper {helper_id} {popup_type} still visible after clicking candidate {idx}"
+                                )
+                        except Exception as e:
+                            logging.debug(
+                                f"helper {helper_id} Error clicking candidate {idx} at ({click_x},{click_y}): {e}"
+                            )
+                            # continue to next candidate
+
+                    if not clicked:
+                        logging.warning(
+                            f"helper {helper_id} No clickable candidate found for {popup_type}"
+                        )
+                    else:
+                        logging.warning(
+                            f"helper {helper_id} Could not close {popup_type} by clicking outside"
+                        )
 
                 except Exception as e:
-                    logging.error(f"helper {helper_id} Error clicking overlay: {e}")
+                    logging.error(
+                        f"helper {helper_id} Error clicking outside overlay: {e}"
+                    )
 
-                logging.warning(f"helper {helper_id} Could not close {popup_type}")
-                return False
+            logging.warning(f"helper {helper_id} Could not close {popup_type}")
+            return False
 
         except Exception as e:
             logging.error(f"helper {helper_id} Error closing {popup_type}: {e}")
             return False
+
+    async def remove_widget(self, page):
+        # Locate the widget
+        widget = page.locator("#agentzee-widget-root")
+
+        # Check if it exists
+        if await widget.count() > 0:
+            logging.info("Widget found, removing...")
+
+            # Remove from DOM
+            await page.evaluate(
+                """
+                const el = document.querySelector('#agentzee-widget-root');
+                if (el) el.remove();
+            """
+            )
+
+            logging.info("Widget removed! ")
+        else:
+            logging.info("Widget not found")
+            
+        widget = page.locator("#headlessui-portal-root")
+
+        # Check if it exists
+        if await widget.count() > 0:
+            logging.info("Widget found, removing...")
+
+            # Remove from DOM
+            await page.evaluate(
+                """
+                const el = document.querySelector('#headlessui-portal-root');
+                if (el) el.remove();
+            """
+            )
+
+            logging.info("Widget removed!")
+        else:
+            logging.info("Widget not found")
 
     async def helper(self, context, helper_id: int):
         """helper that takes URLs from queue"""
@@ -1993,6 +2323,7 @@ class RecursiveScraper:
 
     async def run(
         self,
+        headless: bool = False,
         login_url: str = None,
         login_link_selector: str = None,
         username: str = None,
@@ -2003,13 +2334,27 @@ class RecursiveScraper:
     ):
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=False,
+                headless=headless,
                 args=[
-                    "--start-maximized",
                     "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--start-maximized" if not headless else "",
                 ],
             )
-            context = await browser.new_context(no_viewport=True)
+            if headless:
+                logging.info("Running in headless mode.")
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (...) Chrome/120 Safari/537.36",
+                    viewport={"width": 1920, "height": 1080},
+                    screen={"width": 1920, "height": 1080},
+                )
+            else:
+                logging.info("Running in headed mode with no viewport.")
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (...) Chrome/120 Safari/537.36",
+                    no_viewport=True,
+                )
             if login_url:
                 logging.info(f"Logging in to {login_url}...")
                 page = await self.login_to_website(
@@ -2103,35 +2448,49 @@ class RecursiveScraper:
 
 
 if __name__ == "__main__":
-    # asyncio.run(
-    #     RecursiveScraper(
-    #         "https://webopt.ai/seo/report?id=46ba1dd4-bd83-41af-a4d5-8f50ea037641&pageId=633e3ae9-0d48-4c95-aa7a-6e6da733a1b3", max_concurrency=1, avoid_page=["tools"]
-    #     ).run(
-    #         "https://webopt.ai/",
-    #         "/html/body/div[1]/header/nav/div[3]/div/div/p",
-    #         "vahak77251@bllibl.com",
-    #         "Test@12345",
-    #         "/html/body/div[4]/div/div/div/div[2]/div/div/form/div/div/div[3]/input",
-    #         "/html/body/div[4]/div/div/div/div[2]/div/div/form/div/div/div[3]/div[1]/input",
-    #         "/html/body/div[4]/div/div/div/div[2]/div/div/form/div/div/div[4]/button",
-    #     )
-    # )
-
     asyncio.run(
         RecursiveScraper(
-            "https://app.instantly.ai/app/accounts", max_concurrency=1
+            "https://webopt.ai/seo/report?id=64c47bf3-a2ea-4c55-9415-16cbe929ec5e&pageId=c10fe4d2-67f0-4c86-a749-8c99705728f9", max_concurrency=1, avoid_page=["tools"]
         ).run(
-            login_url="https://app.instantly.ai/auth/login",
-            username="sabarish@episyche.com",
-            password="Test@123!",
-            username_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[1]/input",
-            password_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[2]/input",
-            login_button_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[2]/div[1]/button",
+            False,
+            "https://webopt.ai/",
+            "/html/body/div[1]/header/nav/div[3]/div/div/p",
+            "vahak77251@bllibl.com",
+            "Test@12345",
+            "/html/body/div[4]/div/div/div/div[2]/div/div/form/div/div/div[3]/input",
+            "/html/body/div[4]/div/div/div/div[2]/div/div/form/div/div/div[3]/div[1]/input",
+            "/html/body/div[4]/div/div/div/div[2]/div/div/form/div/div/div[4]/button",
         )
     )
 
     # asyncio.run(
     #     RecursiveScraper(
-    #         "http://localhost:3000/", max_concurrency=5, avoid_page=["tools", "blog"]
-    #     ).run()
+    #         "https://app.instantly.ai/app/accounts", max_concurrency=1
+    #     ).run(
+    #         headless=False,
+    #         login_url="https://app.instantly.ai/auth/login",
+    #         username="sabarish@episyche.com",
+    #         password="Test@123!",
+    #         username_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[1]/input",
+    #         password_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[1]/div[2]/input",
+    #         login_button_selector="/html/body/div[1]/section/div[2]/div/div/div[2]/div/div/form/div/div[2]/div[1]/button",
+    #     )
+    # )
+    # asyncio.run(
+    #     RecursiveScraper(
+    #         "https://v2.dende.ai/dashboard", max_concurrency=1).run(
+    #         headless=False,
+    #         login_url="https://v2.dende.ai/login",
+    #         username="melissa-rogers@powerscrews.com",
+    #         password="Test123!",
+    #         username_selector="/html/body/div[1]/div[1]/main/div[1]/div/form/div[1]/div/input",
+    #         password_selector="/html/body/div[1]/div[1]/main/div[1]/div/form/div[2]/div/input",
+    #         login_button_selector="/html/body/div[1]/div[1]/main/div[1]/div/form/button/span",
+    #     )
+    # )
+
+    # asyncio.run(
+    #     RecursiveScraper(
+    #         "http://localhost:3000/", max_concurrency=1, avoid_page=["tools", "blog"]
+    #     ).run(headless=False)
     # )
