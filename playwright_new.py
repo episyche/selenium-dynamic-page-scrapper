@@ -200,7 +200,7 @@ class RecursiveScraper:
         }
 
         # Optional: Add click lock for extra safety
-        self.click_lock = asyncio.Lock()
+        # self.click_lock = asyncio.Lock()
 
     async def update_stats(self, key: str, increment: int = 1):
         """Update statistics in a thread-safe manner"""
@@ -376,13 +376,11 @@ class RecursiveScraper:
                 "url": page.url,
                 "elements": [],
             }
-            await self.remove_widget(page=page)
-            
+            await self.remove_widget(page=page, helper_id=helper_id)
+
             popups = await self.detect_and_handle_popups(page, helper_id)
             if popups:
                 page_details["popups"] = popups
-
-            
 
             visible_elements_xpaths = await self.get_visible_elements_xpaths(
                 page=page, helper_id=helper_id, purpose="scrape_tab"
@@ -429,8 +427,18 @@ class RecursiveScraper:
                     logging.error(f"[helper {helper_id}] Error closing page: {e}")
 
     async def details_from_thre_xpath(
-        self, xpaths, page, url, helper_id, visible_elements_xpaths, hover_element=None,internal_route_element=None
-    ):
+        self,
+        xpaths,
+        page,
+        url,
+        helper_id,
+        visible_elements_xpaths,
+        hover_element=None,
+        internal_route_element=None,
+        internal_clicked_elements=[],
+    ) -> List[Dict]:
+        """
+        Given a list of xpaths, return detailed info about each element"""
         # to avoid click both parent and child elements
         previous_url = page.url
         parent_xpath = None
@@ -438,6 +446,7 @@ class RecursiveScraper:
         previous_element_xpath = None
         visible_elements = []
         clciked_xpaths = []
+        internal_route_detected_element = []
         current_url = page.url
         for xpath in xpaths:
             is_dropdown_detected = False
@@ -457,16 +466,23 @@ class RecursiveScraper:
                     logging.warning(
                         f"[helper {helper_id}] Element not found for XPath: {xpath} in {url} let refresh the page and retrying..."
                     )
-
-                    # # await page.reload()
                     await page.goto(current_url)
                     await page.wait_for_load_state("domcontentloaded")
                     await self.wait_until_ready(
                         page, timeout=15, settle_time=2, helper_id=helper_id
                     )
-                    await self.remove_widget(page=page)
+                    await self.remove_widget(page=page, helper_id=helper_id)
+                    # conditional hover abd click back internal route element
                     if internal_route_element:
-                        await self.safe_click(element,helper_id,xpath)
+                        for internal_clicked_element in internal_clicked_elements:
+                            if internal_clicked_element:
+                                await self.safe_click(
+                                    internal_clicked_element,
+                                    helper_id=helper_id,
+                                    xpath=await internal_clicked_element.evaluate(
+                                        self.get_xpath_js
+                                    ),
+                                )
                     if hover_element:
                         await self.safe_hover(
                             page,
@@ -485,6 +501,9 @@ class RecursiveScraper:
 
                 tag = (await element.evaluate("(el) => el.tagName")).lower()
                 if tag in ["script", "style", "meta", "link", "noscript"]:
+                    logging.info(
+                        f"[helper {helper_id}] Skipping non-relevant tag: {tag} for XPath: {xpath} in {url}"
+                    )
                     continue
 
                 attrs = await element.evaluate(
@@ -560,7 +579,7 @@ class RecursiveScraper:
                     # Not a duplicate, so clear the duplicate parent tracker
                     duplicate_parent_xpath = None
 
-                # clickable check
+                # clickable check with clickable, enabled and not child of previously clicked
                 if (
                     await self.is_probably_clickable(element, helper_id)
                     and await element.is_enabled()
@@ -617,6 +636,9 @@ class RecursiveScraper:
                     if tag.lower() == "a" and await self.should_skip_link(
                         previous_url, href, helper_id
                     ):
+                        logging.info(
+                            f"[helper {helper_id}] Skipping click on link element: {xpath} in {url} with href: {href}"
+                        )
                         visible_elements.append(element_data)
                         parent_xpath = xpath
                         continue
@@ -650,6 +672,9 @@ class RecursiveScraper:
                             locator=element, helper_id=helper_id, xpath=xpath
                         )
                         if not clicked:
+                            logging.info(
+                                f"[helper {helper_id}] Click failed for element: {xpath} in {url} "
+                            )
                             visible_elements.append(element_data)
                             continue
 
@@ -699,7 +724,13 @@ class RecursiveScraper:
                                 page, timeout=10, settle_time=1.0, helper_id=helper_id
                             )
                             if internal_route_element:
-                                await self.safe_click(internal_route_element,helper_id=helper_id,xpath=await internal_route_element.evaluate(self.get_xpath_js))
+                                await self.safe_click(
+                                    internal_route_element,
+                                    helper_id=helper_id,
+                                    xpath=await internal_route_element.evaluate(
+                                        self.get_xpath_js
+                                    ),
+                                )
 
                         except asyncio.TimeoutError:
                             # No popup opened, check for same-tab navigation
@@ -743,7 +774,13 @@ class RecursiveScraper:
                                     page, helper_id, previous_url=previous_url
                                 )
                                 if internal_route_element:
-                                    await self.safe_click(internal_route_element,helper_id=helper_id,xpath=await internal_route_element.evaluate(self.get_xpath_js))
+                                    await self.safe_click(
+                                        internal_route_element,
+                                        helper_id=helper_id,
+                                        xpath=await internal_route_element.evaluate(
+                                            self.get_xpath_js
+                                        ),
+                                    )
 
                             else:
                                 popup_data = await self.detect_and_handle_popups(
@@ -785,6 +822,7 @@ class RecursiveScraper:
                                 if (
                                     hash_before != hash_after
                                 ) and not is_dropdown_detected:
+                                    internal_route_detected_element.append(xpath)
                                     if previous_element_xpath is None:
                                         previous_element_xpath = (
                                             clciked_xpaths[
@@ -798,6 +836,10 @@ class RecursiveScraper:
                                                 ],
                                                 xpath2=xpath,
                                             )
+                                            and clciked_xpaths[
+                                                clciked_xpaths.index(xpath) - 1
+                                            ]
+                                            not in internal_route_detected_element
                                             else None
                                         )
                                     logging.info(
@@ -813,7 +855,7 @@ class RecursiveScraper:
                                         logging.info(
                                             f"[helper {helper_id}] Found {len(new_xpaths)} new elements internal routes {new_xpaths}."
                                         )
-
+                                        internal_clicked_elements.append(element)
                                         element_data["internal_routes"] = (
                                             await self.details_from_thre_xpath(
                                                 new_xpaths,  # Process only the new elements
@@ -821,9 +863,11 @@ class RecursiveScraper:
                                                 url,
                                                 helper_id,
                                                 visible_xpaths_after,  # Pass the new full list
-                                                internal_route_element=element
+                                                internal_route_element=element,
+                                                internal_clicked_elements=internal_clicked_elements,
                                             )
                                         )
+                                        internal_clicked_elements.remove(element)
                                         managed_ir = await self.manage_internal_navigation(
                                             page=page,
                                             element=element,
@@ -831,6 +875,7 @@ class RecursiveScraper:
                                             previous_element_xpath=previous_element_xpath,
                                             previous_url=previous_url,
                                             hash_before=hash_before,
+                                            internal_clicked_elements=internal_clicked_elements,
                                         )
                                         if managed_ir:
                                             logging.info(
@@ -852,7 +897,7 @@ class RecursiveScraper:
                                             logging.info(
                                                 f"[helper {helper_id}] DOM changed: Content was modified in-place {modified_xpath}."
                                             )
-
+                                            internal_clicked_elements.append(element)
                                             element_data["internal_routes"] = (
                                                 await self.details_from_thre_xpath(
                                                     modified_xpath,  # Process only the new elements
@@ -860,9 +905,11 @@ class RecursiveScraper:
                                                     url,
                                                     helper_id,
                                                     visible_xpaths_after,
-                                                    internal_route_element=element# Pass the new full list
+                                                    internal_route_element=element,  # Pass the new full list
+                                                    internal_clicked_elements=internal_clicked_elements,
                                                 )
                                             )
+                                            internal_clicked_elements.remove(element)
 
                                         else:
                                             logging.info(
@@ -875,6 +922,7 @@ class RecursiveScraper:
                                             previous_element_xpath=previous_element_xpath,
                                             previous_url=previous_url,
                                             hash_before=hash_before,
+                                            internal_clicked_elements=internal_clicked_elements,
                                         )
                                         if managed_ir:
                                             logging.info(
@@ -884,8 +932,8 @@ class RecursiveScraper:
                                             logging.warning(
                                                 f"[helper {helper_id}] unable to manage internal routes in {page.url}"
                                             )
-                                    if internal_route_element:
-                                        await self.safe_click(internal_route_element,helper_id=helper_id,xpath=await internal_route_element.evaluate(self.get_xpath_js))            
+                                    # if internal_route_element:
+                                    #     await self.safe_click(internal_route_element,helper_id=helper_id,xpath=await internal_route_element.evaluate(self.get_xpath_js))
 
                                 else:
                                     logging.info(
@@ -896,6 +944,19 @@ class RecursiveScraper:
                     finally:
                         # Remove the popup listener
                         page.remove_listener("popup", on_popup)
+                else:
+                    if not await self.is_probably_clickable(element, helper_id):
+                        logging.info(
+                            f"[helper {helper_id}] {xpath} is not probably clickable in {url}"
+                        )
+                    elif not await element.is_enabled():
+                        logging.info(
+                            f"[helper {helper_id}] {xpath} is not enabled in {url}"
+                        )
+                    else:
+                        logging.info(
+                            f"[helper {helper_id}] {xpath} a child of previously clicked: {parent_xpath} in {url}"
+                        )
                 visible_elements.append(element_data)
 
             except Exception as e:
@@ -1043,6 +1104,7 @@ class RecursiveScraper:
         previous_element_xpath: Optional[str],
         previous_url: str,
         hash_before: str,
+        internal_clicked_elements=[],
     ) -> bool:
         """
         Try to return to a previous element (if provided) after a DOM change,
@@ -1050,10 +1112,22 @@ class RecursiveScraper:
         verify URL and DOM hash. Returns True if returned to original state (hash matches),
         False otherwise.
         """
-        async def refresh_and_check()->bool:
+
+        async def refresh_and_check() -> bool:
             await page.goto(previous_url)
-            await self.wait_until_ready(page=page,timeout=15,settle_time=5,helper_id=helper_id)
-            await self.remove_widget(page=page)
+            await self.wait_until_ready(
+                page=page, timeout=15, settle_time=5, helper_id=helper_id
+            )
+            await self.remove_widget(page=page, helper_id=helper_id)
+            if internal_clicked_elements:
+                for internal_clicked_element in internal_clicked_elements:
+                    await self.safe_click(
+                        internal_clicked_element,
+                        helper_id=helper_id,
+                        xpath=await internal_clicked_element.evaluate(
+                            self.get_xpath_js
+                        ),
+                    )
             xpaths_here = await self.get_visible_elements_xpaths(
                 page=page,
                 helper_id=helper_id,
@@ -1074,7 +1148,6 @@ class RecursiveScraper:
                     f"[helper {helper_id}] state changed: previous hash != current hash after refreshing the page (page.url={page.url})"
                 )
                 return False
-            
 
         async def post_click_checks() -> bool:
             # common post-click sequence
@@ -1092,7 +1165,16 @@ class RecursiveScraper:
                     await self.wait_until_ready(
                         page=page, timeout=15, settle_time=2, helper_id=helper_id
                     )
-                    await self.remove_widget(page=page)
+                    await self.remove_widget(page=page, helper_id=helper_id)
+                    if internal_clicked_elements:
+                        for internal_clicked_element in internal_clicked_elements:
+                            await self.safe_click(
+                                internal_clicked_element,
+                                helper_id=helper_id,
+                                xpath=await internal_clicked_element.evaluate(
+                                    self.get_xpath_js
+                                ),
+                            )
                 except Exception as exc:
                     logging.error(
                         f"[helper {helper_id}] failed to navigate back to previous_url {previous_url}: {exc}"
@@ -1136,7 +1218,7 @@ class RecursiveScraper:
             if await post_click_checks():
                 return True
             return await refresh_and_check()
-        
+
         else:
             logging.info(
                 f"[helper {helper_id}] No previous element to return to after DOM change — clicking the same element."
@@ -1169,7 +1251,7 @@ class RecursiveScraper:
                 await self.wait_until_ready(
                     page, timeout=15, settle_time=1, helper_id=helper_id
                 )
-                await self.remove_widget(page=page)
+                await self.remove_widget(page=page, helper_id=helper_id)
                 logging.info(f"[helper {helper_id}] URL corrected successfully.")
 
         try:
@@ -1179,7 +1261,7 @@ class RecursiveScraper:
             await self.wait_until_ready(
                 page, timeout=15, settle_time=1, helper_id=helper_id
             )
-            await self.remove_widget(page=page)
+            await self.remove_widget(page=page, helper_id=helper_id)
 
             logging.info(
                 f"[helper {helper_id}] Went back successfully using go_back()."
@@ -1200,7 +1282,7 @@ class RecursiveScraper:
                 await self.wait_until_ready(
                     page, timeout=15, settle_time=1, helper_id=helper_id
                 )
-                await self.remove_widget(page=page)
+                await self.remove_widget(page=page, helper_id=helper_id)
                 logging.info(
                     f"[helper {helper_id}] Went back using JS fallback successfully."
                 )
@@ -1214,7 +1296,7 @@ class RecursiveScraper:
                 await self.wait_until_ready(
                     page, timeout=15, settle_time=1, helper_id=helper_id
                 )
-                await self.remove_widget(page=page)
+                await self.remove_widget(page=page, helper_id=helper_id)
                 logging.info(
                     f"[helper {helper_id}] Fallback navigation to previous URL succeeded."
                 )
@@ -2170,13 +2252,13 @@ class RecursiveScraper:
             logging.error(f"helper {helper_id} Error closing {popup_type}: {e}")
             return False
 
-    async def remove_widget(self, page):
+    async def remove_widget(self, page, helper_id):
         # Locate the widget
         widget = page.locator("#agentzee-widget-root")
 
         # Check if it exists
         if await widget.count() > 0:
-            logging.info("Widget found, removing...")
+            logging.info(f"Helper :{helper_id} Widget found, removing...")
 
             # Remove from DOM
             await page.evaluate(
@@ -2186,15 +2268,15 @@ class RecursiveScraper:
             """
             )
 
-            logging.info("Widget removed! ")
+            logging.info(f"Helper :{helper_id} Widget removed! ")
         else:
-            logging.info("Widget not found")
-            
+            logging.info(f"Helper :{helper_id} Widget not found")
+
         widget = page.locator("#headlessui-portal-root")
 
         # Check if it exists
         if await widget.count() > 0:
-            logging.info("Widget found, removing...")
+            logging.info(f"Helper :{helper_id} Widget found, removing...")
 
             # Remove from DOM
             await page.evaluate(
@@ -2204,9 +2286,9 @@ class RecursiveScraper:
             """
             )
 
-            logging.info("Widget removed!")
+            logging.info(f"Helper :{helper_id} Widget removed!")
         else:
-            logging.info("Widget not found")
+            logging.info(f"Helper :{helper_id} Widget not found")
 
     async def helper(self, context, helper_id: int):
         """helper that takes URLs from queue"""
@@ -2450,7 +2532,7 @@ class RecursiveScraper:
 if __name__ == "__main__":
     asyncio.run(
         RecursiveScraper(
-            "https://webopt.ai/seo/report?id=64c47bf3-a2ea-4c55-9415-16cbe929ec5e&pageId=c10fe4d2-67f0-4c86-a749-8c99705728f9", max_concurrency=1, avoid_page=["tools"]
+            "https://webopt.ai/ui-ux/edit/839fe420-a6c6-427f-ab08-e173756381c4?pageId=85201640-60f2-44d8-ba63-271e1ae24b41", max_concurrency=3, avoid_page=["tools","blog","dashboard","settings"]
         ).run(
             False,
             "https://webopt.ai/",
@@ -2490,7 +2572,7 @@ if __name__ == "__main__":
     # )
 
     # asyncio.run(
-    #     RecursiveScraper(
-    #         "http://localhost:3000/", max_concurrency=1, avoid_page=["tools", "blog"]
-    #     ).run(headless=False)
+    #     RecursiveScraper("http://localhost:3000/page5", max_concurrency=1).run(
+    #         headless=False
+    #     )
     # )
