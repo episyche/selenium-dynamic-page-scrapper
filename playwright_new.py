@@ -23,7 +23,7 @@ import aiosqlite
 # --- logging setup (ensure directory exists) ---
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
-    filename="logs/playwright.log",
+    filename="logs/playwright1.log",
     encoding="utf-8",
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(filename)s:%(lineno)d | %(message)s",
@@ -315,25 +315,40 @@ class RecursiveScraper:
 
     get_xpath_js = """
 (el) => {
-    function getXPath(el) {
-        if (el.nodeType === Node.DOCUMENT_NODE) return '';
-        if (el === document.body) return '/html/body';
-        let ix = 0;
-        let siblings = el.parentNode ? el.parentNode.childNodes : [];
-        for (let i = 0; i < siblings.length; i++) {
-            let sib = siblings[i];
-            if (sib.nodeType === 1 && sib.tagName === el.tagName) ix++;
-            if (sib === el) {
-                // use *[name()='tag'] for svg elements
-                const tagName = (el.namespaceURI === 'http://www.w3.org/2000/svg')
-                    ? "*[name()='" + el.tagName.toLowerCase() + "']"
-                    : el.tagName.toLowerCase();
-                return getXPath(el.parentNode) + '/' + tagName + '[' + ix + ']';
-            }
-        }
+  function getXPath(el) {
+    if (!el) return '';
+    if (el.nodeType === Node.DOCUMENT_NODE) return '';
+    // If it's the body element, return a nice canonical path
+    if (el === document.body) return '/html/body';
+
+    // Only work with elements
+    if (el.nodeType !== Node.ELEMENT_NODE) {
+      // fallback: use parent element
+      return getXPath(el.parentElement);
     }
-    // use the provided parameter `el` (arrow functions don't have `arguments`)
-    return getXPath(el);
+
+    const tagIsSVG = el.namespaceURI === 'http://www.w3.org/2000/svg';
+    const tagName = tagIsSVG ? "*[name()='" + el.tagName.toLowerCase() + "']" : el.tagName.toLowerCase();
+
+    // Count how many previous sibling elements of the same tag exist,
+    // then index = previousCount + 1 (1-based)
+    let index = 1;
+    for (let sib = el.previousElementSibling; sib; sib = sib.previousElementSibling) {
+      if (tagIsSVG) {
+        // for SVG we compare lowercased tagName to be safe
+        if (sib.tagName && sib.tagName.toLowerCase() === el.tagName.toLowerCase()) {
+          index++;
+        }
+      } else {
+        if (sib.tagName === el.tagName) index++;
+      }
+    }
+
+    const parentPath = getXPath(el.parentElement);
+    return parentPath + '/' + tagName + '[' + index + ']';
+  }
+
+  return getXPath(el);
 }
 """
 
@@ -494,7 +509,7 @@ class RecursiveScraper:
                         )
                     element = page.locator(f"xpath={xpath}")
                     if not await element.count():
-                        logging.warning(
+                        logging.error(
                             f"[helper {helper_id}] Element not found for XPath: {xpath} in {url} after refresh the page"
                         )
                         continue
@@ -546,38 +561,39 @@ class RecursiveScraper:
 
                 # Create hashcode
                 key_hash = hashlib.sha256(key_str.encode()).hexdigest()
-                if duplicate_parent_xpath and await self.is_child_xpath(
-                    duplicate_parent_xpath, xpath
-                ):
-                    logging.info(
-                        f"[helper {helper_id}] Skipping element inside duplicate parent: {xpath} in {url} for {element_data_include_child_text}"
-                    )
-                    navigation = await self.state.get_navigation(key_hash)
-                    if navigation:
+                if "?" not in page.url:
+                    if duplicate_parent_xpath and await self.is_child_xpath(
+                        duplicate_parent_xpath, xpath
+                    ):
                         logging.info(
-                            f"[helper {helper_id}] Found previous navigation for duplicate element: {navigation}"
+                            f"[helper {helper_id}] Skipping element inside duplicate parent: {xpath} in {url} for {element_data_include_child_text}"
                         )
-                        element_data["navigated_to"] = navigation
-                    visible_elements.append(element_data)
-                    continue
-                was_added = await self.state.add_unique_hash(key_hash)
-                if not was_added:
-                    duplicate_parent_xpath = xpath
-                    logging.info(
-                        f"[helper {helper_id}] Duplicate element skipped: {xpath} in {url} for {element_data_include_child_text} "
-                    )
-                    # Check if we have navigation info for this duplicate
-                    navigation = await self.state.get_navigation(key_hash)
-                    if navigation:
+                        navigation = await self.state.get_navigation(key_hash)
+                        if navigation:
+                            logging.info(
+                                f"[helper {helper_id}] Found previous navigation for duplicate element: {navigation}"
+                            )
+                            element_data["navigated_to"] = navigation
+                        visible_elements.append(element_data)
+                        continue
+                    was_added = await self.state.add_unique_hash(key_hash)
+                    if not was_added:
+                        duplicate_parent_xpath = xpath
                         logging.info(
-                            f"[helper {helper_id}] Found previous navigation for duplicate element: {navigation}"
+                            f"[helper {helper_id}] Duplicate element skipped: {xpath} in {url} for {element_data_include_child_text} "
                         )
-                        element_data["navigated_to"] = navigation
-                    visible_elements.append(element_data)
-                    continue
-                else:
-                    # Not a duplicate, so clear the duplicate parent tracker
-                    duplicate_parent_xpath = None
+                        # Check if we have navigation info for this duplicate
+                        navigation = await self.state.get_navigation(key_hash)
+                        if navigation:
+                            logging.info(
+                                f"[helper {helper_id}] Found previous navigation for duplicate element: {navigation}"
+                            )
+                            element_data["navigated_to"] = navigation
+                        visible_elements.append(element_data)
+                        continue
+                    else:
+                        # Not a duplicate, so clear the duplicate parent tracker
+                        duplicate_parent_xpath = None
 
                 # clickable check with clickable, enabled and not child of previously clicked
                 if (
@@ -735,7 +751,7 @@ class RecursiveScraper:
                         except asyncio.TimeoutError:
                             # No popup opened, check for same-tab navigation
                             logging.info(
-                                f"[helper {helper_id}] No popup detected, checking for navigation"
+                                f"[helper {helper_id}] No new tab was detected, checking for navigation"
                             )
 
                             await page.wait_for_load_state(
@@ -2532,9 +2548,9 @@ class RecursiveScraper:
 if __name__ == "__main__":
     asyncio.run(
         RecursiveScraper(
-            "https://webopt.ai/ui-ux/edit/839fe420-a6c6-427f-ab08-e173756381c4?pageId=85201640-60f2-44d8-ba63-271e1ae24b41", max_concurrency=3, avoid_page=["tools","blog","dashboard","settings"]
+            "https://webopt.ai/seo/report?id=cc6089cd-8516-418c-af77-3bf949805cde&pageId=598a9835-ded6-4291-9a2d-6f7d628ea1e6", max_concurrency=1, avoid_page=["tools", "blog"]
         ).run(
-            False,
+            True,
             "https://webopt.ai/",
             "/html/body/div[1]/header/nav/div[3]/div/div/p",
             "vahak77251@bllibl.com",
@@ -2572,7 +2588,7 @@ if __name__ == "__main__":
     # )
 
     # asyncio.run(
-    #     RecursiveScraper("http://localhost:3000/page5", max_concurrency=1).run(
-    #         headless=False
+    #     RecursiveScraper("http://localhost:3000/", max_concurrency=5).run(
+    #         headless=True
     #     )
     # )
