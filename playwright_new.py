@@ -23,7 +23,7 @@ import aiosqlite
 # --- logging setup (ensure directory exists) ---
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
-    filename="logs/playwright1.log",
+    filename="logs/playwright2.log",
     encoding="utf-8",
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(filename)s:%(lineno)d | %(message)s",
@@ -176,7 +176,7 @@ class RecursiveScraper:
         # Replace shared state with thread-safe container
         self.state = ThreadSafeState()
         netloc = re.sub(r"[^a-zA-Z0-9._-]", "_", parsed.netloc)
-        self.db = Database_Handler(f"{netloc}.db")
+        self.db = Database_Handler(f"{netloc}1.db")
         self.avoid_page = avoid_page or []
         self.avoid_buttons = [
             "logout",
@@ -351,6 +351,28 @@ class RecursiveScraper:
   return getXPath(el);
 }
 """
+    GET_XPATHS_BATCH = """
+() => {
+  function getXPath(el) {
+    if (!el) return '';
+    if (el === document.body) return '/html/body';
+    if (el.nodeType !== Node.ELEMENT_NODE) return getXPath(el.parentElement);
+
+    const tagIsSVG = el.namespaceURI === 'http://www.w3.org/2000/svg';
+    const tagName = tagIsSVG ? "*[name()='"+ el.tagName.toLowerCase() +"']" : el.tagName.toLowerCase();
+
+    let index = 1;
+    for (let sib = el.previousElementSibling; sib; sib = sib.previousElementSibling) {
+      if (sib.tagName && sib.tagName.toLowerCase() === el.tagName.toLowerCase()) index++;
+    }
+
+    return getXPath(el.parentElement) + '/' + tagName + '[' + index + ']';
+  }
+
+  const els = Array.from(document.querySelectorAll("body *:not(script):not(style):not(meta):not(noscript):not(link):not(title)"));
+  return els.map(el => getXPath(el));
+}
+"""
 
     async def scrape_tab(self, context, url, helper_id: int):
         """Scrape visible elements and click interactive pointer elements recursively."""
@@ -391,11 +413,13 @@ class RecursiveScraper:
                 "url": page.url,
                 "elements": [],
             }
-            await self.remove_widget(page=page, helper_id=helper_id)
-
             popups = await self.detect_and_handle_popups(page, helper_id)
             if popups:
                 page_details["popups"] = popups
+                
+            await self.remove_widget(page=page, helper_id=helper_id)
+
+            
 
             visible_elements_xpaths = await self.get_visible_elements_xpaths(
                 page=page, helper_id=helper_id, purpose="scrape_tab"
@@ -1406,54 +1430,64 @@ class RecursiveScraper:
         try:
             await self.wait_until_ready(page=page, timeout=5, settle_time=1)
 
-            # 1. Define your locator
-            selector = "body *:not(script):not(style):not(meta):not(noscript):not(link):not(title)"
+        #     # 1. Define your locator
+        #     selector = "body *:not(script):not(style):not(meta):not(noscript):not(link):not(title)"
 
-            # 2. Get the stable "snapshot" list of locators
-            try:
-                all_handles = await page.query_selector_all(selector)
-            except PlaywrightTimeoutError:
-                logging.warning(
-                    f" helper {helper_id} : Timed out getting initial element list in  {purpose}."
-                )
-                return []
+        #     # 2. Get the stable "snapshot" list of locators
+        #     try:
+        #         all_handles = await page.query_selector_all(selector)
+        #     except PlaywrightTimeoutError:
+        #         logging.warning(
+        #             f" helper {helper_id} : Timed out getting initial element list in  {purpose}."
+        #         )
+        #         return []
 
-            total = len(all_handles)
-            if total == 0:
-                logging.info(
-                    f" helper {helper_id} : No elements found to process in {page.url} in {purpose}"
-                )
-                return []
+        #     total = len(all_handles)
+        #     if total == 0:
+        #         logging.info(
+        #             f" helper {helper_id} : No elements found to process in {page.url} in {purpose}"
+        #         )
+        #         return []
 
-            logging.info(
-                f" helper {helper_id} : found {total} elements in {purpose}. Processing CONCURRENTLY."
-            )
+        #     logging.info(
+        #         f" helper {helper_id} : found {total} elements in {purpose}. Processing CONCURRENTLY."
+        #     )
 
-            # 3.Create a list of tasks (coroutines) to run
-            tasks = []
-            for i, element_handle in enumerate(all_handles):
-                tasks.append(
-                    # Call our helper for each element
-                    self.get_single_xpath(element_handle, helper_id, i)
-                )
+        #     # 3.Create a list of tasks (coroutines) to run
+        #     tasks = []
+        #     for i, element_handle in enumerate(all_handles):
+        #         tasks.append(
+        #             # Call our helper for each element
+        #             self.get_single_xpath(element_handle, helper_id, i)
+        #         )
 
-            # 4. Run all tasks concurrently and get results
-            # This is where the speed comes from!
-            results = await asyncio.gather(*tasks)
+        #     # 4. Run all tasks concurrently and get results
+        #     # This is where the speed comes from!
+        #     results = await asyncio.gather(*tasks)
 
-            # 5. Filter out the None values (from failed/invisible elements)
-            xpaths = [xpath for xpath in results if xpath is not None]
+        #     # 5. Filter out the None values (from failed/invisible elements)
+        #     xpaths = [xpath for xpath in results if xpath is not None]
 
-            logging.info(
-                f" helper {helper_id} : Successfully extracted {len(xpaths)} visible xpaths in {purpose}."
-            )
+        #     logging.info(
+        #         f" helper {helper_id} : Successfully extracted {len(xpaths)} visible xpaths in {purpose}."
+        #     )
+        #     return xpaths
+
+        # except Exception as e:
+        #     logging.error(
+        #         f" helper {helper_id} Error in get_visible_elements_xpaths: {e}"
+        #     )
+        #     logging.error(traceback.format_exc())
+        #     return []
+            xpaths = await page.evaluate(self.GET_XPATHS_BATCH)
+
+            # Filter duplicates & empty
+            xpaths = [x for x in xpaths if x and await (page.locator(f"xpath={x}")).is_visible()]
+
+            logging.info(f"helper {helper_id}: Extracted {len(xpaths)} xpaths in {purpose}")
             return xpaths
-
         except Exception as e:
-            logging.error(
-                f" helper {helper_id} Error in get_visible_elements_xpaths: {e}"
-            )
-            logging.error(traceback.format_exc())
+            logging.error(f"XPath batch error: {e}")
             return []
 
     async def get_visible_content_map(
@@ -2330,6 +2364,7 @@ class RecursiveScraper:
                     continue
 
                 logging.info(f"helper {helper_id}: Processing URL: {url}")
+                print(f"helper {helper_id}: Processing URL: {url}")
                 await self.scrape_tab(context, url, helper_id)
                 self.to_visit.task_done()
 
@@ -2548,7 +2583,7 @@ class RecursiveScraper:
 if __name__ == "__main__":
     asyncio.run(
         RecursiveScraper(
-            "https://webopt.ai/seo/report?id=cc6089cd-8516-418c-af77-3bf949805cde&pageId=598a9835-ded6-4291-9a2d-6f7d628ea1e6", max_concurrency=1, avoid_page=["tools", "blog"]
+            "https://webopt.ai/seo/report?id=cc6089cd-8516-418c-af77-3bf949805cde&pageId=598a9835-ded6-4291-9a2d-6f7d628ea1e6", max_concurrency=5, avoid_page=["tools"]
         ).run(
             True,
             "https://webopt.ai/",
@@ -2588,7 +2623,7 @@ if __name__ == "__main__":
     # )
 
     # asyncio.run(
-    #     RecursiveScraper("http://localhost:3000/", max_concurrency=5).run(
+    #     RecursiveScraper("http://localhost:3000/page5", max_concurrency=5).run(
     #         headless=True
     #     )
     # )
