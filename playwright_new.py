@@ -23,7 +23,7 @@ import aiosqlite
 # --- logging setup (ensure directory exists) ---
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
-    filename="logs/playwright2.log",
+    filename="logs/playwright3_1.log",
     encoding="utf-8",
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(filename)s:%(lineno)d | %(message)s",
@@ -176,7 +176,7 @@ class RecursiveScraper:
         # Replace shared state with thread-safe container
         self.state = ThreadSafeState()
         netloc = re.sub(r"[^a-zA-Z0-9._-]", "_", parsed.netloc)
-        self.db = Database_Handler(f"{netloc}1.db")
+        self.db = Database_Handler(f"{netloc}_testing.db")
         self.avoid_page = avoid_page or []
         self.avoid_buttons = [
             "logout",
@@ -416,11 +416,8 @@ class RecursiveScraper:
             popups = await self.detect_and_handle_popups(page, helper_id)
             if popups:
                 page_details["popups"] = popups
-                
+
             await self.remove_widget(page=page, helper_id=helper_id)
-
-            
-
             visible_elements_xpaths = await self.get_visible_elements_xpaths(
                 page=page, helper_id=helper_id, purpose="scrape_tab"
             )
@@ -445,8 +442,9 @@ class RecursiveScraper:
                 logging.info(
                     f"[helper {helper_id}] Page saved to database: {page_details['url']}"
                 )
+                print(f"helper {helper_id} Page scrapped: {page_details['url']}")
             except Exception as e:
-                logging.error(f"[helper {helper_id}] Error saving to DB: {e}")
+                logging.error(f"helper {helper_id} Error saving to DB: {e}")
 
             await self.update_stats("urls_processed")
 
@@ -518,6 +516,7 @@ class RecursiveScraper:
                                 await self.safe_click(
                                     internal_clicked_element,
                                     helper_id=helper_id,
+                                    purpose="clcicking internal elements for find elements",
                                     xpath=await internal_clicked_element.evaluate(
                                         self.get_xpath_js
                                     ),
@@ -709,7 +708,10 @@ class RecursiveScraper:
                             f"[helper {helper_id}] Clicking element: {xpath} in {url} "
                         )
                         clicked = await self.safe_click(
-                            locator=element, helper_id=helper_id, xpath=xpath
+                            locator=element,
+                            helper_id=helper_id,
+                            purpose="click the element in the loop",
+                            xpath=xpath,
                         )
                         if not clicked:
                             logging.info(
@@ -767,6 +769,7 @@ class RecursiveScraper:
                                 await self.safe_click(
                                     internal_route_element,
                                     helper_id=helper_id,
+                                    purpose="clicking the internal element after closing the new tab",
                                     xpath=await internal_route_element.evaluate(
                                         self.get_xpath_js
                                     ),
@@ -817,6 +820,7 @@ class RecursiveScraper:
                                     await self.safe_click(
                                         internal_route_element,
                                         helper_id=helper_id,
+                                        purpose="clciking the internal element afte same tab navigation",
                                         xpath=await internal_route_element.evaluate(
                                             self.get_xpath_js
                                         ),
@@ -863,115 +867,132 @@ class RecursiveScraper:
                                     hash_before != hash_after
                                 ) and not is_dropdown_detected:
                                     internal_route_detected_element.append(xpath)
+                                    # if previous_element_xpath is None:
+                                    #     previous_element_xpath = (
+                                    #         clciked_xpaths[
+                                    #             clciked_xpaths.index(xpath) - 1
+                                    #         ]
+                                    #         if clciked_xpaths.index(xpath) > 0
+                                    #         and await self.have_same_parents(
+                                    #             page=page,
+                                    #             xpath1=clciked_xpaths[
+                                    #                 clciked_xpaths.index(xpath) - 1
+                                    #             ],
+                                    #             xpath2=xpath,
+                                    #         )
+                                    #         and clciked_xpaths[
+                                    #             clciked_xpaths.index(xpath) - 1
+                                    #         ]
+                                    #         not in internal_route_detected_element
+                                    #         else None
+                                    #     )
                                     if previous_element_xpath is None:
-                                        previous_element_xpath = (
-                                            clciked_xpaths[
+                                        if clciked_xpaths.index(xpath) > 0:
+                                            logging.info("found more than 0 elements in previously clciked xpaths ")
+                                            xpath1 = clciked_xpaths[
                                                 clciked_xpaths.index(xpath) - 1
                                             ]
-                                            if clciked_xpaths.index(xpath) > 0
-                                            and await self.have_same_parents(
-                                                page=page,
-                                                xpath1=clciked_xpaths[
-                                                    clciked_xpaths.index(xpath) - 1
-                                                ],
-                                                xpath2=xpath,
-                                            )
-                                            and clciked_xpaths[
-                                                clciked_xpaths.index(xpath) - 1
-                                            ]
-                                            not in internal_route_detected_element
-                                            else None
-                                        )
+                                            xpath2 = xpath
+                                            if await self.have_same_parents(
+                                                page, xpath1, xpath2
+                                            ):
+                                                logging.info(f"both {xpath1},{xpath2} elements have same parent xpaths")
+                                                if (
+                                                    xpath1
+                                                    not in internal_route_detected_element
+                                                ):
+                                                    logging.info(f"previous element {xpath1} is not internal routes detected elements")
+                                                    previous_element_xpath = xpath1
                                     logging.info(
                                         f"[helper {helper_id}] DOM changed after click on {xpath} in {url}."
                                     )
-                                    new_xpaths = [
-                                        x
-                                        for x in visible_xpaths_after
-                                        if x not in visible_elements_xpaths
-                                    ]
+                                    # new_xpaths = [
+                                    #     x
+                                    #     for x in visible_xpaths_after
+                                    #     if x not in visible_elements_xpaths
+                                    # ]
 
-                                    if new_xpaths:
+                                    # if new_xpaths:
+                                    #     logging.info(
+                                    #         f"[helper {helper_id}] Found {len(new_xpaths)} new elements internal routes {new_xpaths}."
+                                    #     )
+                                    #     internal_clicked_elements.append(element)
+                                    #     element_data["internal_routes"] = (
+                                    #         await self.details_from_thre_xpath(
+                                    #             new_xpaths,  # Process only the new elements
+                                    #             page,
+                                    #             url,
+                                    #             helper_id,
+                                    #             visible_xpaths_after,  # Pass the new full list
+                                    #             internal_route_element=element,
+                                    #             internal_clicked_elements=internal_clicked_elements,
+                                    #         )
+                                    #     )
+                                    #     internal_clicked_elements.remove(element)
+                                    #     managed_ir = await self.manage_internal_navigation(
+                                    #         page=page,
+                                    #         element=element,
+                                    #         helper_id=helper_id,
+                                    #         previous_element_xpath=previous_element_xpath,
+                                    #         previous_url=previous_url,
+                                    #         hash_before=hash_before,
+                                    #         internal_clicked_elements=internal_clicked_elements,
+                                    #     )
+                                    #     if managed_ir:
+                                    #         logging.info(
+                                    #             f"[Helper {helper_id}]: managed the internal routes in {page.url}"
+                                    #         )
+                                    #     else:
+                                    #         logging.info(
+                                    #             f"[helper {helper_id}] unable to manage internal routes"
+                                    #         )
+
+                                    # else:
+                                    modified_xpath = (
+                                        await self._get_modified_elements_data(
+                                            map_before, map_after
+                                        )
+                                    )
+                                    if modified_xpath:
+                                        # No new XPaths, so the change must be in-place.
                                         logging.info(
-                                            f"[helper {helper_id}] Found {len(new_xpaths)} new elements internal routes {new_xpaths}."
+                                            f"[helper {helper_id}] DOM changed: Content was modified in-place {modified_xpath}."
                                         )
                                         internal_clicked_elements.append(element)
                                         element_data["internal_routes"] = (
                                             await self.details_from_thre_xpath(
-                                                new_xpaths,  # Process only the new elements
+                                                modified_xpath,  # Process only the new elements
                                                 page,
                                                 url,
                                                 helper_id,
-                                                visible_xpaths_after,  # Pass the new full list
-                                                internal_route_element=element,
+                                                visible_xpaths_after,
+                                                internal_route_element=element,  # Pass the new full list
                                                 internal_clicked_elements=internal_clicked_elements,
                                             )
                                         )
                                         internal_clicked_elements.remove(element)
-                                        managed_ir = await self.manage_internal_navigation(
-                                            page=page,
-                                            element=element,
-                                            helper_id=helper_id,
-                                            previous_element_xpath=previous_element_xpath,
-                                            previous_url=previous_url,
-                                            hash_before=hash_before,
-                                            internal_clicked_elements=internal_clicked_elements,
-                                        )
-                                        if managed_ir:
-                                            logging.info(
-                                                f"[Helper {helper_id}]: managed the internal routes in {page.url}"
-                                            )
-                                        else:
-                                            logging.info(
-                                                f"[helper {helper_id}] unable to manage internal routes"
-                                            )
 
                                     else:
-                                        modified_xpath = (
-                                            self._get_modified_elements_data(
-                                                map_before, map_after
-                                            )
+                                        logging.info(
+                                            f"[helper {helper_id}] DOM changed but no new elements detected or some elements removed after click on {xpath} in {url}."
                                         )
-                                        if modified_xpath:
-                                            # No new XPaths, so the change must be in-place.
-                                            logging.info(
-                                                f"[helper {helper_id}] DOM changed: Content was modified in-place {modified_xpath}."
-                                            )
-                                            internal_clicked_elements.append(element)
-                                            element_data["internal_routes"] = (
-                                                await self.details_from_thre_xpath(
-                                                    modified_xpath,  # Process only the new elements
-                                                    page,
-                                                    url,
-                                                    helper_id,
-                                                    visible_xpaths_after,
-                                                    internal_route_element=element,  # Pass the new full list
-                                                    internal_clicked_elements=internal_clicked_elements,
-                                                )
-                                            )
-                                            internal_clicked_elements.remove(element)
-
-                                        else:
-                                            logging.info(
-                                                f"[helper {helper_id}] DOM changed but no new elements detected or some elements removed after click on {xpath} in {url}."
-                                            )
-                                        managed_ir = await self.manage_internal_navigation(
-                                            page=page,
-                                            element=element,
-                                            helper_id=helper_id,
-                                            previous_element_xpath=previous_element_xpath,
-                                            previous_url=previous_url,
-                                            hash_before=hash_before,
-                                            internal_clicked_elements=internal_clicked_elements,
+                                    managed_ir = await self.manage_internal_navigation(
+                                        page=page,
+                                        element=element,
+                                        helper_id=helper_id,
+                                        previous_element_xpath=previous_element_xpath,
+                                        previous_url=previous_url,
+                                        hash_before=hash_before,
+                                        internal_clicked_elements=internal_clicked_elements,
+                                    )
+                                    if managed_ir:
+                                        logging.info(
+                                            f"[Helper {helper_id}]: managed the internal routes in {page.url}"
                                         )
-                                        if managed_ir:
-                                            logging.info(
-                                                f"[Helper {helper_id}]: managed the internal routes in {page.url}"
-                                            )
-                                        else:
-                                            logging.warning(
-                                                f"[helper {helper_id}] unable to manage internal routes in {page.url}"
-                                            )
+                                    else:
+                                        logging.warning(
+                                            f"[helper {helper_id}] unable to manage internal routes in {page.url}"
+                                        )
                                     # if internal_route_element:
                                     #     await self.safe_click(internal_route_element,helper_id=helper_id,xpath=await internal_route_element.evaluate(self.get_xpath_js))
 
@@ -1094,6 +1115,7 @@ class RecursiveScraper:
         self,
         locator: Locator,
         helper_id: str,
+        purpose: str,
         xpath: Optional[str] = None,
         timeout: float = 5000,
     ) -> bool:
@@ -1109,14 +1131,14 @@ class RecursiveScraper:
             await locator.wait_for(state="visible", timeout=timeout)
         except PlaywrightTimeoutError:
             logging.warning(
-                f"[helper {helper_id}] element not visible (xpath={xpath}) after {timeout}ms."
+                f"[helper {helper_id}] element not visible (xpath={xpath}) after {timeout}ms for {purpose}."
             )
             return False
 
         try:
             await locator.click()
             logging.info(
-                f"[helper {helper_id}] clicked element (xpath={xpath}) via locator.click()."
+                f"[helper {helper_id}] clicked element (xpath={xpath}) via locator.click() for {purpose}."
             )
             return True
         except Exception as exc:
@@ -1127,7 +1149,7 @@ class RecursiveScraper:
             try:
                 await locator.evaluate("(el) => el.click()")
                 logging.info(
-                    f"[helper {helper_id}] clicked element (xpath={xpath}) via JS fallback."
+                    f"[helper {helper_id}] clicked element (xpath={xpath}) via JS fallback {purpose}."
                 )
                 return True
             except Exception as exc2:
@@ -1164,6 +1186,7 @@ class RecursiveScraper:
                     await self.safe_click(
                         internal_clicked_element,
                         helper_id=helper_id,
+                        purpose="clciking nested internal routes after refresh in manage in internal routes",
                         xpath=await internal_clicked_element.evaluate(
                             self.get_xpath_js
                         ),
@@ -1211,6 +1234,7 @@ class RecursiveScraper:
                             await self.safe_click(
                                 internal_clicked_element,
                                 helper_id=helper_id,
+                                purpose="clciking in manage internal routes after wrong navigation",
                                 xpath=await internal_clicked_element.evaluate(
                                     self.get_xpath_js
                                 ),
@@ -1249,7 +1273,10 @@ class RecursiveScraper:
                 f"[helper {helper_id}] Returning to previous element {previous_element_xpath} after DOM change."
             )
             clicked = await self.safe_click(
-                previous_element, helper_id, xpath=previous_element_xpath
+                previous_element,
+                helper_id,
+                "clciking the previous element in manage internal routes",
+                xpath=previous_element_xpath,
             )
             if not clicked:
                 logging.warning(
@@ -1267,7 +1294,11 @@ class RecursiveScraper:
             xpath_for_log = await element.evaluate(self.get_xpath_js)
 
             clicked = await self.safe_click(
-                element, helper_id, xpath=xpath_for_log, timeout=5000
+                element,
+                helper_id,
+                "clicking the same element in manage internal routes",
+                xpath=xpath_for_log,
+                timeout=5000,
             )
             if not clicked:
                 logging.warning(
@@ -1370,27 +1401,12 @@ class RecursiveScraper:
                 logging.info(
                     f"[helper {helper_id}] dropdown detected after hover {await element.evaluate(self.get_xpath_js)} in {page.url}."
                 )
-                new_xpaths = [
-                    x
-                    for x in visible_xpaths_after_hover
-                    if x not in visible_elements_xpaths
-                ]
-                if new_xpaths:
-                    logging.info(f"helper {helper_id} changed xpath{new_xpaths}")
-                    dropdown_data = await self.details_from_thre_xpath(
-                        new_xpaths,
-                        page,
-                        page.url,
-                        helper_id,
-                        visible_xpaths_after_hover,
-                        element,
-                    )
-                    return dropdown_data
-                else:
+                
 
-                    modified_xpath = self._get_modified_elements_data(
-                        map_before_hover, map_after_hover
-                    )
+                modified_xpath = await self._get_modified_elements_data(
+                    map_before_hover, map_after_hover
+                )
+                if modified_xpath:
                     logging.info(f"helper {helper_id} modified xpath{modified_xpath}")
                     dropdown_data = await self.details_from_thre_xpath(
                         modified_xpath,
@@ -1401,8 +1417,11 @@ class RecursiveScraper:
                         element,
                     )
                     return dropdown_data
-            logging.info(f"[helper {helper_id}]:no dropdown detected")
-            return None
+                logging.info(f"helper {helper_id} dom changed but no modified xpath detected")
+                return None
+            else:
+                logging.info(f"[helper {helper_id}]:no dropdown detected")
+                return None
         except Exception as e:
             logging.error(
                 f"[helper {helper_id}]:Error detecting dropdown after hover: {e}"
@@ -1430,61 +1449,65 @@ class RecursiveScraper:
         try:
             await self.wait_until_ready(page=page, timeout=5, settle_time=1)
 
-        #     # 1. Define your locator
-        #     selector = "body *:not(script):not(style):not(meta):not(noscript):not(link):not(title)"
+            #     # 1. Define your locator
+            #     selector = "body *:not(script):not(style):not(meta):not(noscript):not(link):not(title)"
 
-        #     # 2. Get the stable "snapshot" list of locators
-        #     try:
-        #         all_handles = await page.query_selector_all(selector)
-        #     except PlaywrightTimeoutError:
-        #         logging.warning(
-        #             f" helper {helper_id} : Timed out getting initial element list in  {purpose}."
-        #         )
-        #         return []
+            #     # 2. Get the stable "snapshot" list of locators
+            #     try:
+            #         all_handles = await page.query_selector_all(selector)
+            #     except PlaywrightTimeoutError:
+            #         logging.warning(
+            #             f" helper {helper_id} : Timed out getting initial element list in  {purpose}."
+            #         )
+            #         return []
 
-        #     total = len(all_handles)
-        #     if total == 0:
-        #         logging.info(
-        #             f" helper {helper_id} : No elements found to process in {page.url} in {purpose}"
-        #         )
-        #         return []
+            #     total = len(all_handles)
+            #     if total == 0:
+            #         logging.info(
+            #             f" helper {helper_id} : No elements found to process in {page.url} in {purpose}"
+            #         )
+            #         return []
 
-        #     logging.info(
-        #         f" helper {helper_id} : found {total} elements in {purpose}. Processing CONCURRENTLY."
-        #     )
+            #     logging.info(
+            #         f" helper {helper_id} : found {total} elements in {purpose}. Processing CONCURRENTLY."
+            #     )
 
-        #     # 3.Create a list of tasks (coroutines) to run
-        #     tasks = []
-        #     for i, element_handle in enumerate(all_handles):
-        #         tasks.append(
-        #             # Call our helper for each element
-        #             self.get_single_xpath(element_handle, helper_id, i)
-        #         )
+            #     # 3.Create a list of tasks (coroutines) to run
+            #     tasks = []
+            #     for i, element_handle in enumerate(all_handles):
+            #         tasks.append(
+            #             # Call our helper for each element
+            #             self.get_single_xpath(element_handle, helper_id, i)
+            #         )
 
-        #     # 4. Run all tasks concurrently and get results
-        #     # This is where the speed comes from!
-        #     results = await asyncio.gather(*tasks)
+            #     # 4. Run all tasks concurrently and get results
+            #     # This is where the speed comes from!
+            #     results = await asyncio.gather(*tasks)
 
-        #     # 5. Filter out the None values (from failed/invisible elements)
-        #     xpaths = [xpath for xpath in results if xpath is not None]
+            #     # 5. Filter out the None values (from failed/invisible elements)
+            #     xpaths = [xpath for xpath in results if xpath is not None]
 
-        #     logging.info(
-        #         f" helper {helper_id} : Successfully extracted {len(xpaths)} visible xpaths in {purpose}."
-        #     )
-        #     return xpaths
+            #     logging.info(
+            #         f" helper {helper_id} : Successfully extracted {len(xpaths)} visible xpaths in {purpose}."
+            #     )
+            #     return xpaths
 
-        # except Exception as e:
-        #     logging.error(
-        #         f" helper {helper_id} Error in get_visible_elements_xpaths: {e}"
-        #     )
-        #     logging.error(traceback.format_exc())
-        #     return []
+            # except Exception as e:
+            #     logging.error(
+            #         f" helper {helper_id} Error in get_visible_elements_xpaths: {e}"
+            #     )
+            #     logging.error(traceback.format_exc())
+            #     return []
             xpaths = await page.evaluate(self.GET_XPATHS_BATCH)
 
             # Filter duplicates & empty
-            xpaths = [x for x in xpaths if x and await (page.locator(f"xpath={x}")).is_visible()]
+            xpaths = [
+                x for x in xpaths if x and await page.locator(f"xpath={x}").is_visible()
+            ]
 
-            logging.info(f"helper {helper_id}: Extracted {len(xpaths)} xpaths in {purpose}")
+            logging.info(
+                f"helper {helper_id}: Extracted {len(xpaths)} xpaths in {purpose}"
+            )
             return xpaths
         except Exception as e:
             logging.error(f"XPath batch error: {e}")
@@ -1552,18 +1575,26 @@ class RecursiveScraper:
             # Return a unique hash to force a "change" state on error
             return hashlib.sha256(f"error_{time.time()}".encode()).hexdigest()
 
-    def _get_modified_elements_data(
+    async def _get_modified_elements_data(
         self, map_before: Dict[str, str], map_after: Dict[str, str]
     ) -> List[str]:
         """
         Compares two content maps and returns a list of dictionaries
         for elements with modified text.
         """
-        modified_xpath = []
-        # We only care about xpaths present in both, but with different text
-        common_xpaths = set(map_before.keys()) & set(map_after.keys())
+        before_keys = set(map_before.keys())
+        after_keys = set(map_after.keys())
 
-        for x in sorted(list(common_xpaths)):
+        modified_xpath = []
+        created_xpaths = sorted(list(after_keys - before_keys))
+
+        for x in created_xpaths:
+            modified_xpath.append(x)
+
+        # We only care about xpaths present in both, but with different text
+        common_xpaths = sorted(list(before_keys & after_keys))
+
+        for x in common_xpaths:
             text_before = map_before.get(x)
             text_after = map_after.get(x)
 
@@ -1576,36 +1607,82 @@ class RecursiveScraper:
                 and text_before != text_after
             ):
                 modified_xpath.append(x)
-        return modified_xpath
+        return await self.arrange_in_order(modified_xpath)
 
+    async def arrange_in_order(self, xpaths: List):
+        def parse_xpath(xpath):
+            """Parse XPath into a list of (tag, index) tuples for comparison."""
+            parts = xpath.strip("/").split("/")
+            parsed = []
+            for part in parts:
+                if "[" in part:
+                    tag = part.split("[")[0]
+                    predicate = part.split("[")[1].rstrip("]")
+                    # Try to parse as integer, otherwise use 0
+                    try:
+                        index = int(predicate)
+                    except ValueError:
+                        # For non-numeric predicates, use 0 as default
+                        index = 0
+                    parsed.append((tag, index, predicate))
+                else:
+                    parsed.append((part, 0, ""))
+            return parsed
+
+        def compare_xpath(xpath1, xpath2):
+            """Compare two XPaths for DOM ordering."""
+            p1 = parse_xpath(xpath1)
+            p2 = parse_xpath(xpath2)
+
+            # Compare element by element
+            for i in range(min(len(p1), len(p2))):
+                tag1, idx1, pred1 = p1[i]
+                tag2, idx2, pred2 = p2[i]
+
+                # If tags differ, compare alphabetically
+                if tag1 != tag2:
+                    return -1 if tag1 < tag2 else 1
+
+                # If indices differ, compare numerically
+                if idx1 != idx2:
+                    return -1 if idx1 < idx2 else 1
+
+                # If predicates differ, compare alphabetically
+                if pred1 != pred2:
+                    return -1 if pred1 < pred2 else 1
+
+            # If all common parts match, shorter path comes first
+            return -1 if len(p1) < len(p2) else (1 if len(p1) > len(p2) else 0)
+
+        def sort_xpaths_dom_order(xpaths):
+            """Sort XPaths in DOM tree order."""
+            from functools import cmp_to_key
+
+            return sorted(xpaths, key=cmp_to_key(compare_xpath))
+
+        # Sort in DOM order
+        sorted_xpaths = sort_xpaths_dom_order(xpaths)
+        return sorted_xpaths
+    
     async def safe_hover(
         self,
         page,
         element: Locator,
         helper_id,
         *,
-        timeout: int = 3000,  # ms for individual waits
-        overall_timeout: int = 8000,  # ms total budget for hover attempts
+        timeout: int = 3000,  # ms for hover operation
     ):
         """
-        Robust hover with multiple fallbacks:
-        1. ensure visible & scroll into view
-        2. normal hover()
-        3. move mouse to element center (page.mouse.move) then mouseover
-        4. force hover
-        5. temporarily disable overlay intercepting element (pointer-events:none) and retry
-        6. dispatch PointerEvent / MouseEvent via JS (with coordinates)
+        Simple hover function without fallbacks for faster execution.
         Returns True on success, False otherwise.
         """
-        start = time.time()
-        xpath_for_log = "[xpath_unavailable]"  # Fallback log
+        xpath_for_log = "[xpath_unavailable]"
         try:
             xpath_for_log = await element.evaluate(self.get_xpath_js)
         except Exception:
-            logging.error("Xpath of the element is unable to find")
-            pass  # Element might be gone, logging will use fallback
-
-            # 1) Ensure visible & scrolled into view
+            logging.error(f"Xpath of the element is unable to find {page.url}")
+            pass
+        
         try:
             await element.scroll_into_view_if_needed(timeout=timeout)
         except Exception as e:
@@ -1613,207 +1690,253 @@ class RecursiveScraper:
                 f"[helper {helper_id}] scroll_into_view_if_needed failed: {e}"
             )
 
-        # Helper to abort if overall timeout passed
-        def timed_out():
-            return (time.time() - start) * 1000 > overall_timeout
-
-        # 2) Try normal hover via Playwright API
+        # Simple hover attempt
         try:
             await element.hover(timeout=timeout)
-            logging.info(f"[helper {helper_id}] Hovered normally: {xpath_for_log}")
-            await page.wait_for_timeout(150)
+            logging.info(f"[helper {helper_id}] Hovered: {xpath_for_log} in {page.url}")
             return True
         except Exception as e:
             logging.warning(
-                f"[helper {helper_id}] Normal hover failed for {xpath_for_log}: {e}"
-            )
-
-        if timed_out():
-            logging.warning(
-                f"[helper {helper_id}] safe_hover: overall timeout after normal hover for {xpath_for_log}"
+                f"[helper {helper_id}] Hover failed for {xpath_for_log} in {page.url}: {e}"
             )
             return False
 
-        # 3) Try moving mouse to center using bounding box + page.mouse.move + mouseover
-        try:
-            box = await element.bounding_box()
-            if box:
-                cx = box["x"] + box["width"] / 2
-                cy = box["y"] + box["height"] / 2
-                # Move there (Playwright mouse uses page coordinates)
-                await page.mouse.move(cx, cy, steps=8)
-                # Fire pointer/mouse events at that coordinate
-                await page.mouse.down()
-                await page.mouse.up()
-                # small pause to let site react
-                await page.wait_for_timeout(120)
-                logging.info(
-                    f"[helper {helper_id}] Moved mouse to center for {xpath_for_log} at ({cx:.1f},{cy:.1f})"
-                )
-                # After moving, try hover() again (sometimes now it works)
-                try:
-                    await element.hover(timeout=1000)
-                    logging.info(
-                        f"[helper {helper_id}] Hover succeeded after mouse.move: {xpath_for_log}"
-                    )
-                    await page.wait_for_timeout(120)
-                    return True
-                except Exception:
-                    logging.debug(
-                        f"[helper {helper_id}] hover still failed after mouse.move for {xpath_for_log}"
-                    )
-            else:
-                logging.debug(
-                    f"[helper {helper_id}] bounding_box is None for {xpath_for_log}"
-                )
-        except Exception as e:
-            logging.debug(
-                f"[helper {helper_id}] mouse.move approach failed for {xpath_for_log}: {e}"
-            )
+    # async def safe_hover(
+    #     self,
+    #     page,
+    #     element: Locator,
+    #     helper_id,
+    #     *,
+    #     timeout: int = 3000,  # ms for individual waits
+    #     overall_timeout: int = 8000,  # ms total budget for hover attempts
+    # ):
+    #     """
+    #     Robust hover with multiple fallbacks:
+    #     1. ensure visible & scroll into view
+    #     2. normal hover()
+    #     3. move mouse to element center (page.mouse.move) then mouseover
+    #     4. force hover
+    #     5. temporarily disable overlay intercepting element (pointer-events:none) and retry
+    #     6. dispatch PointerEvent / MouseEvent via JS (with coordinates)
+    #     Returns True on success, False otherwise.
+    #     """
+    #     start = time.time()
+    #     xpath_for_log = "[xpath_unavailable]"  # Fallback log
+    #     try:
+    #         xpath_for_log = await element.evaluate(self.get_xpath_js)
+    #     except Exception:
+    #         logging.error("Xpath of the element is unable to find")
+    #         pass  # Element might be gone, logging will use fallback
 
-        if timed_out():
-            logging.warning(
-                f"[helper {helper_id}] safe_hover: overall timeout after mouse.move for {xpath_for_log}"
-            )
-            return False
+    #         # 1) Ensure visible & scrolled into view
+    #     try:
+    #         await element.scroll_into_view_if_needed(timeout=timeout)
+    #     except Exception as e:
+    #         logging.debug(
+    #             f"[helper {helper_id}] scroll_into_view_if_needed failed: {e}"
+    #         )
 
-        # 4) Try force hover (shorter timeout)
-        try:
-            await element.hover(force=True, timeout=1000)
-            logging.info(
-                f"[helper {helper_id}] Forced hover succeeded for {xpath_for_log}"
-            )
-            await page.wait_for_timeout(120)
-            return True
-        except Exception as e:
-            logging.warning(
-                f"[helper {helper_id}] Forced hover failed for {xpath_for_log}: {e}"
-            )
+    #     # Helper to abort if overall timeout passed
+    #     def timed_out():
+    #         return (time.time() - start) * 1000 > overall_timeout
 
-        if timed_out():
-            logging.warning(
-                f"[helper {helper_id}] safe_hover: overall timeout after force hover for {xpath_for_log}"
-            )
-            return False
+    #     # 2) Try normal hover via Playwright API
+    #     try:
+    #         await element.hover(timeout=timeout)
+    #         logging.info(f"[helper {helper_id}] Hovered normally: {xpath_for_log}")
+    #         await page.wait_for_timeout(150)
+    #         return True
+    #     except Exception as e:
+    #         logging.warning(
+    #             f"[helper {helper_id}] Normal hover failed for {xpath_for_log}: {e}"
+    #         )
 
-        # 5) Check for intercepting element at center and temporarily disable it (pointer-events: none)
-        try:
-            intercept_info = await page.evaluate(
-                """
-                (el) => {
-                    try {
-                        const rect = el.getBoundingClientRect();
-                        const x = rect.left + rect.width/2;
-                        const y = rect.top + rect.height/2;
-                        const topEl = document.elementFromPoint(x, y);
-                        if (!topEl) return null;
-                        if (topEl === el || el.contains(topEl)) return null;
-                        // collect a short descriptor so we can log it
-                        const desc = { tag: topEl.tagName, cls: topEl.className ? topEl.className.toString().slice(0,200) : '', id: topEl.id || '' };
-                        // store original pointer-events so we can revert
-                        const original = topEl.style.pointerEvents || '';
-                        topEl.style.pointerEvents = 'none';
-                        return { desc, original: original };
-                    } catch (err) { return null; }
-                }
-                """,
-                await element.element_handle(),
-            )
-            if intercept_info:
-                logging.warning(
-                    f"[helper {helper_id}] Interceptor found for {xpath_for_log}: {intercept_info.get('desc')}, temporarily disabled it."
-                )
-                # retry hover after disabling overlay
-                try:
-                    await element.hover(timeout=1200)
-                    logging.info(
-                        f"[helper {helper_id}] Hover succeeded after disabling interceptor for {xpath_for_log}"
-                    )
-                    # revert pointer-events
-                    await element.evaluate(
-                        """
-                        (el) => {
-                            const rect = el.getBoundingClientRect();
-                            const x = rect.left + rect.width/2;
-                            const y = rect.top + rect.height/2;
-                            const topEl = document.elementFromPoint(x, y);
-                            if (topEl) topEl.style.pointerEvents = '';
-                        }
-                        """
-                    )
-                    await page.wait_for_timeout(120)
-                    return True
-                except Exception as e:
-                    logging.debug(
-                        f"[helper {helper_id}] hover failed after disabling interceptor: {e}"
-                    )
-                    # attempt to revert anyway
-                    try:
-                        await element.evaluate(
-                            """
-                            (el) => {
-                                const rect = el.getBoundingClientRect();
-                                const x = rect.left + rect.width/2;
-                                const y = rect.top + rect.height/2;
-                                const topEl = document.elementFromPoint(x, y);
-                                if (topEl) topEl.style.pointerEvents = '';
-                            }
-                            """
-                        )
-                    except Exception:
-                        pass
-        except Exception as overlay_e:
-            logging.debug(
-                f"[helper {helper_id}] overlay disable attempt failed: {overlay_e}"
-            )
+    #     if timed_out():
+    #         logging.warning(
+    #             f"[helper {helper_id}] safe_hover: overall timeout after normal hover for {xpath_for_log}"
+    #         )
+    #         return False
 
-        if timed_out():
-            logging.warning(
-                f"[helper {helper_id}] safe_hover: overall timeout after overlay attempt for {xpath_for_log}"
-            )
-            return False
+    #     # 3) Try moving mouse to center using bounding box + page.mouse.move + mouseover
+    #     try:
+    #         box = await element.bounding_box()
+    #         if box:
+    #             cx = box["x"] + box["width"] / 2
+    #             cy = box["y"] + box["height"] / 2
+    #             # Move there (Playwright mouse uses page coordinates)
+    #             await page.mouse.move(cx, cy, steps=8)
+    #             # Fire pointer/mouse events at that coordinate
+    #             await page.mouse.down()
+    #             await page.mouse.up()
+    #             # small pause to let site react
+    #             await page.wait_for_timeout(120)
+    #             logging.info(
+    #                 f"[helper {helper_id}] Moved mouse to center for {xpath_for_log} at ({cx:.1f},{cy:.1f})"
+    #             )
+    #             # After moving, try hover() again (sometimes now it works)
+    #             try:
+    #                 await element.hover(timeout=1000)
+    #                 logging.info(
+    #                     f"[helper {helper_id}] Hover succeeded after mouse.move: {xpath_for_log}"
+    #                 )
+    #                 await page.wait_for_timeout(120)
+    #                 return True
+    #             except Exception:
+    #                 logging.debug(
+    #                     f"[helper {helper_id}] hover still failed after mouse.move for {xpath_for_log}"
+    #                 )
+    #         else:
+    #             logging.debug(
+    #                 f"[helper {helper_id}] bounding_box is None for {xpath_for_log}"
+    #             )
+    #     except Exception as e:
+    #         logging.debug(
+    #             f"[helper {helper_id}] mouse.move approach failed for {xpath_for_log}: {e}"
+    #         )
 
-        # 6) Final fallback: dispatch PointerEvent / MouseEvent at center with coordinates
-        try:
-            # compute coords again if possible
-            box = await element.bounding_box()
-            coords = {"x": 0, "y": 0}
-            if box:
-                coords["x"] = box["x"] + box["width"] / 2
-                coords["y"] = box["y"] + box["height"] / 2
+    #     if timed_out():
+    #         logging.warning(
+    #             f"[helper {helper_id}] safe_hover: overall timeout after mouse.move for {xpath_for_log}"
+    #         )
+    #         return False
 
-            await element.evaluate(
-                """
-                (el, cx, cy) => {
-                    function dispatch(type, x, y) {
-                        let ev;
-                        try {
-                            ev = new PointerEvent(type, { bubbles: true, cancelable: true, pointerType: 'mouse', clientX: x, clientY: y });
-                        } catch(e) {
-                            ev = new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y });
-                        }
-                        el.dispatchEvent(ev);
-                    }
-                    dispatch('pointerover', cx, cy);
-                    dispatch('pointerenter', cx, cy);
-                    dispatch('mouseover', cx, cy);
-                    dispatch('mouseenter', cx, cy);
-                }
-                """,
-                coords["x"],
-                coords["y"],
-            )
-            await page.wait_for_timeout(150)
-            logging.info(
-                f"[helper {helper_id}] Dispatched pointer/mouse events for {xpath_for_log}"
-            )
-            return True
-        except Exception as js_e:
-            logging.error(
-                f"[helper {helper_id}] JS dispatch hover failed for {xpath_for_log}: {js_e}"
-            )
-            logging.debug(traceback.format_exc())
-            return False
+    #     # 4) Try force hover (shorter timeout)
+    #     try:
+    #         await element.hover(force=True, timeout=1000)
+    #         logging.info(
+    #             f"[helper {helper_id}] Forced hover succeeded for {xpath_for_log}"
+    #         )
+    #         await page.wait_for_timeout(120)
+    #         return True
+    #     except Exception as e:
+    #         logging.warning(
+    #             f"[helper {helper_id}] Forced hover failed for {xpath_for_log}: {e}"
+    #         )
+
+    #     if timed_out():
+    #         logging.warning(
+    #             f"[helper {helper_id}] safe_hover: overall timeout after force hover for {xpath_for_log}"
+    #         )
+    #         return False
+
+    #     # 5) Check for intercepting element at center and temporarily disable it (pointer-events: none)
+    #     try:
+    #         intercept_info = await page.evaluate(
+    #             """
+    #             (el) => {
+    #                 try {
+    #                     const rect = el.getBoundingClientRect();
+    #                     const x = rect.left + rect.width/2;
+    #                     const y = rect.top + rect.height/2;
+    #                     const topEl = document.elementFromPoint(x, y);
+    #                     if (!topEl) return null;
+    #                     if (topEl === el || el.contains(topEl)) return null;
+    #                     // collect a short descriptor so we can log it
+    #                     const desc = { tag: topEl.tagName, cls: topEl.className ? topEl.className.toString().slice(0,200) : '', id: topEl.id || '' };
+    #                     // store original pointer-events so we can revert
+    #                     const original = topEl.style.pointerEvents || '';
+    #                     topEl.style.pointerEvents = 'none';
+    #                     return { desc, original: original };
+    #                 } catch (err) { return null; }
+    #             }
+    #             """,
+    #             await element.element_handle(),
+    #         )
+    #         if intercept_info:
+    #             logging.warning(
+    #                 f"[helper {helper_id}] Interceptor found for {xpath_for_log}: {intercept_info.get('desc')}, temporarily disabled it."
+    #             )
+    #             # retry hover after disabling overlay
+    #             try:
+    #                 await element.hover(timeout=1200)
+    #                 logging.info(
+    #                     f"[helper {helper_id}] Hover succeeded after disabling interceptor for {xpath_for_log}"
+    #                 )
+    #                 # revert pointer-events
+    #                 await element.evaluate(
+    #                     """
+    #                     (el) => {
+    #                         const rect = el.getBoundingClientRect();
+    #                         const x = rect.left + rect.width/2;
+    #                         const y = rect.top + rect.height/2;
+    #                         const topEl = document.elementFromPoint(x, y);
+    #                         if (topEl) topEl.style.pointerEvents = '';
+    #                     }
+    #                     """
+    #                 )
+    #                 await page.wait_for_timeout(120)
+    #                 return True
+    #             except Exception as e:
+    #                 logging.debug(
+    #                     f"[helper {helper_id}] hover failed after disabling interceptor: {e}"
+    #                 )
+    #                 # attempt to revert anyway
+    #                 try:
+    #                     await element.evaluate(
+    #                         """
+    #                         (el) => {
+    #                             const rect = el.getBoundingClientRect();
+    #                             const x = rect.left + rect.width/2;
+    #                             const y = rect.top + rect.height/2;
+    #                             const topEl = document.elementFromPoint(x, y);
+    #                             if (topEl) topEl.style.pointerEvents = '';
+    #                         }
+    #                         """
+    #                     )
+    #                 except Exception:
+    #                     pass
+    #     except Exception as overlay_e:
+    #         logging.debug(
+    #             f"[helper {helper_id}] overlay disable attempt failed: {overlay_e}"
+    #         )
+
+    #     if timed_out():
+    #         logging.warning(
+    #             f"[helper {helper_id}] safe_hover: overall timeout after overlay attempt for {xpath_for_log}"
+    #         )
+    #         return False
+
+    #     # 6) Final fallback: dispatch PointerEvent / MouseEvent at center with coordinates
+    #     try:
+    #         # compute coords again if possible
+    #         box = await element.bounding_box()
+    #         coords = {"x": 0, "y": 0}
+    #         if box:
+    #             coords["x"] = box["x"] + box["width"] / 2
+    #             coords["y"] = box["y"] + box["height"] / 2
+
+    #         await element.evaluate(
+    #             """
+    #             (el, cx, cy) => {
+    #                 function dispatch(type, x, y) {
+    #                     let ev;
+    #                     try {
+    #                         ev = new PointerEvent(type, { bubbles: true, cancelable: true, pointerType: 'mouse', clientX: x, clientY: y });
+    #                     } catch(e) {
+    #                         ev = new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y });
+    #                     }
+    #                     el.dispatchEvent(ev);
+    #                 }
+    #                 dispatch('pointerover', cx, cy);
+    #                 dispatch('pointerenter', cx, cy);
+    #                 dispatch('mouseover', cx, cy);
+    #                 dispatch('mouseenter', cx, cy);
+    #             }
+    #             """,
+    #             coords["x"],
+    #             coords["y"],
+    #         )
+    #         await page.wait_for_timeout(150)
+    #         logging.info(
+    #             f"[helper {helper_id}] Dispatched pointer/mouse events for {xpath_for_log}"
+    #         )
+    #         return True
+    #     except Exception as js_e:
+    #         logging.error(
+    #             f"[helper {helper_id}] JS dispatch hover failed for {xpath_for_log}: {js_e}"
+    #         )
+    #         logging.debug(traceback.format_exc())
+    #         return False
 
     async def is_child_xpath(self, parent_xpath, child_xpath):
         """
@@ -2583,7 +2706,7 @@ class RecursiveScraper:
 if __name__ == "__main__":
     asyncio.run(
         RecursiveScraper(
-            "https://webopt.ai/seo/report?id=cc6089cd-8516-418c-af77-3bf949805cde&pageId=598a9835-ded6-4291-9a2d-6f7d628ea1e6", max_concurrency=5, avoid_page=["tools"]
+            "https://webopt.ai/", max_concurrency=5, avoid_page=["tools"]
         ).run(
             True,
             "https://webopt.ai/",
@@ -2623,7 +2746,7 @@ if __name__ == "__main__":
     # )
 
     # asyncio.run(
-    #     RecursiveScraper("http://localhost:3000/page5", max_concurrency=5).run(
+    #     RecursiveScraper("http://localhost:3000/", max_concurrency=5).run(
     #         headless=True
     #     )
     # )
